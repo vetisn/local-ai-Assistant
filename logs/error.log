@@ -1,4 +1,1 @@
-2025-12-22 09:04:47 - error - ERROR - 错误发生: TypeError: Object of type Session is not JSON serializable
-2025-12-22 09:04:47 - error - ERROR - 错误上下文: API调用失败: chat_with_conversation
-2025-12-22 09:05:00 - error - ERROR - 错误发生: TypeError: Object of type Session is not JSON serializable
-2025-12-22 09:05:00 - error - ERROR - 错误上下文: API调用失败: chat_with_conversation
+
