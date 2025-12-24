@@ -21,6 +21,22 @@ def get_conversations(db: Session) -> List[models.Conversation]:
     )
 
 
+def get_latest_conversation(db: Session) -> Optional[models.Conversation]:
+    return (
+        db.query(models.Conversation)
+        .order_by(models.Conversation.id.desc())
+        .first()
+    )
+
+
+def get_conversation_message_count(db: Session, conversation_id: int) -> int:
+    return (
+        db.query(models.Message)
+        .filter(models.Message.conversation_id == conversation_id)
+        .count()
+    )
+
+
 def create_conversation(
     db: Session,
     title: str = "新对话",
@@ -31,6 +47,7 @@ def create_conversation(
     db.commit()
     db.refresh(conversation)
     return conversation
+
 
 
 def delete_conversation(db: Session, conversation_id: int) -> None:
@@ -565,3 +582,316 @@ def delete_setting(db: Session, key: str) -> None:
     if setting:
         db.delete(setting)
         db.commit()
+
+
+# ========= 新增：知识图谱 CRUD =========
+
+def create_entity(
+    db: Session,
+    *,
+    kb_id: Optional[int] = None,
+    document_id: Optional[int] = None,
+    name: str,
+    entity_type: str,
+    description: Optional[str] = None,
+    properties: Optional[str] = None,
+) -> models.KnowledgeEntity:
+    """创建知识图谱实体"""
+    entity = models.KnowledgeEntity(
+        kb_id=kb_id,
+        document_id=document_id,
+        name=name,
+        entity_type=entity_type,
+        description=description,
+        properties=properties,
+    )
+    db.add(entity)
+    db.commit()
+    db.refresh(entity)
+    return entity
+
+
+def get_entity(db: Session, entity_id: int) -> Optional[models.KnowledgeEntity]:
+    """获取单个实体"""
+    return db.query(models.KnowledgeEntity).filter(models.KnowledgeEntity.id == entity_id).first()
+
+
+def get_entity_by_name(
+    db: Session,
+    name: str,
+    kb_id: Optional[int] = None,
+) -> Optional[models.KnowledgeEntity]:
+    """根据名称获取实体"""
+    q = db.query(models.KnowledgeEntity).filter(models.KnowledgeEntity.name == name)
+    if kb_id is not None:
+        q = q.filter(models.KnowledgeEntity.kb_id == kb_id)
+    return q.first()
+
+
+def list_entities(
+    db: Session,
+    kb_id: Optional[int] = None,
+    entity_type: Optional[str] = None,
+    limit: int = 100,
+) -> List[models.KnowledgeEntity]:
+    """列出实体"""
+    q = db.query(models.KnowledgeEntity)
+    if kb_id is not None:
+        q = q.filter(models.KnowledgeEntity.kb_id == kb_id)
+    if entity_type is not None:
+        q = q.filter(models.KnowledgeEntity.entity_type == entity_type)
+    return q.order_by(models.KnowledgeEntity.id.desc()).limit(limit).all()
+
+
+def search_entities(
+    db: Session,
+    query: str,
+    kb_id: Optional[int] = None,
+    limit: int = 10,
+) -> List[models.KnowledgeEntity]:
+    """搜索实体（模糊匹配名称和描述）"""
+    q = db.query(models.KnowledgeEntity).filter(
+        (models.KnowledgeEntity.name.ilike(f"%{query}%")) |
+        (models.KnowledgeEntity.description.ilike(f"%{query}%"))
+    )
+    if kb_id is not None:
+        q = q.filter(models.KnowledgeEntity.kb_id == kb_id)
+    return q.limit(limit).all()
+
+
+def delete_entity(db: Session, entity_id: int) -> None:
+    """删除实体（会级联删除相关关系）"""
+    entity = get_entity(db, entity_id)
+    if entity:
+        db.delete(entity)
+        db.commit()
+
+
+def create_relation(
+    db: Session,
+    *,
+    kb_id: Optional[int] = None,
+    source_id: int,
+    target_id: int,
+    relation_type: str,
+    description: Optional[str] = None,
+    weight: int = 1,
+) -> models.KnowledgeRelation:
+    """创建知识图谱关系"""
+    relation = models.KnowledgeRelation(
+        kb_id=kb_id,
+        source_id=source_id,
+        target_id=target_id,
+        relation_type=relation_type,
+        description=description,
+        weight=weight,
+    )
+    db.add(relation)
+    db.commit()
+    db.refresh(relation)
+    return relation
+
+
+def get_relation(db: Session, relation_id: int) -> Optional[models.KnowledgeRelation]:
+    """获取单个关系"""
+    return db.query(models.KnowledgeRelation).filter(models.KnowledgeRelation.id == relation_id).first()
+
+
+def list_relations(
+    db: Session,
+    kb_id: Optional[int] = None,
+    entity_id: Optional[int] = None,
+    relation_type: Optional[str] = None,
+    limit: int = 100,
+) -> List[models.KnowledgeRelation]:
+    """列出关系"""
+    q = db.query(models.KnowledgeRelation)
+    if kb_id is not None:
+        q = q.filter(models.KnowledgeRelation.kb_id == kb_id)
+    if entity_id is not None:
+        q = q.filter(
+            (models.KnowledgeRelation.source_id == entity_id) |
+            (models.KnowledgeRelation.target_id == entity_id)
+        )
+    if relation_type is not None:
+        q = q.filter(models.KnowledgeRelation.relation_type == relation_type)
+    return q.order_by(models.KnowledgeRelation.id.desc()).limit(limit).all()
+
+
+def get_entity_relations(
+    db: Session,
+    entity_id: int,
+    direction: str = "both",  # "outgoing", "incoming", "both"
+) -> List[models.KnowledgeRelation]:
+    """获取实体的所有关系"""
+    if direction == "outgoing":
+        return db.query(models.KnowledgeRelation).filter(
+            models.KnowledgeRelation.source_id == entity_id
+        ).all()
+    elif direction == "incoming":
+        return db.query(models.KnowledgeRelation).filter(
+            models.KnowledgeRelation.target_id == entity_id
+        ).all()
+    else:
+        return db.query(models.KnowledgeRelation).filter(
+            (models.KnowledgeRelation.source_id == entity_id) |
+            (models.KnowledgeRelation.target_id == entity_id)
+        ).all()
+
+
+def delete_relation(db: Session, relation_id: int) -> None:
+    """删除关系"""
+    relation = get_relation(db, relation_id)
+    if relation:
+        db.delete(relation)
+        db.commit()
+
+
+def get_related_entities(
+    db: Session,
+    entity_id: int,
+    max_depth: int = 2,
+    kb_id: Optional[int] = None,
+) -> List[dict]:
+    """
+    获取与指定实体相关的所有实体（图遍历）
+    返回格式: [{"entity": Entity, "relation": Relation, "depth": int}, ...]
+    """
+    visited = set()
+    results = []
+    
+    def traverse(current_id: int, depth: int):
+        if depth > max_depth or current_id in visited:
+            return
+        visited.add(current_id)
+        
+        relations = get_entity_relations(db, current_id)
+        for rel in relations:
+            # 确定相关实体
+            related_id = rel.target_id if rel.source_id == current_id else rel.source_id
+            if related_id not in visited:
+                related_entity = get_entity(db, related_id)
+                if related_entity and (kb_id is None or related_entity.kb_id == kb_id):
+                    results.append({
+                        "entity": related_entity,
+                        "relation": rel,
+                        "depth": depth,
+                    })
+                    traverse(related_id, depth + 1)
+    
+    traverse(entity_id, 1)
+    return results
+
+
+def batch_create_entities_and_relations(
+    db: Session,
+    *,
+    kb_id: Optional[int] = None,
+    document_id: Optional[int] = None,
+    entities: List[dict],
+    relations: List[dict],
+) -> dict:
+    """
+    批量创建实体和关系
+    entities: [{"name": str, "entity_type": str, "description": str}, ...]
+    relations: [{"source": str, "target": str, "relation_type": str}, ...]
+    """
+    entity_map = {}  # name -> entity
+    created_entities = []
+    created_relations = []
+    
+    # 1. 创建或获取实体
+    for ent_data in entities:
+        name = ent_data.get("name", "").strip()
+        if not name:
+            continue
+        
+        # 检查是否已存在
+        existing = get_entity_by_name(db, name, kb_id)
+        if existing:
+            entity_map[name] = existing
+        else:
+            entity = models.KnowledgeEntity(
+                kb_id=kb_id,
+                document_id=document_id,
+                name=name,
+                entity_type=ent_data.get("entity_type", "概念"),
+                description=ent_data.get("description"),
+                properties=json.dumps(ent_data.get("properties", {}), ensure_ascii=False) if ent_data.get("properties") else None,
+            )
+            db.add(entity)
+            db.flush()  # 获取ID
+            entity_map[name] = entity
+            created_entities.append(entity)
+    
+    # 2. 创建关系
+    for rel_data in relations:
+        source_name = rel_data.get("source", "").strip()
+        target_name = rel_data.get("target", "").strip()
+        relation_type = rel_data.get("relation_type", "相关")
+        
+        if not source_name or not target_name:
+            continue
+        
+        source = entity_map.get(source_name)
+        target = entity_map.get(target_name)
+        
+        if source and target and source.id != target.id:
+            # 检查是否已存在相同关系
+            existing_rel = db.query(models.KnowledgeRelation).filter(
+                models.KnowledgeRelation.source_id == source.id,
+                models.KnowledgeRelation.target_id == target.id,
+                models.KnowledgeRelation.relation_type == relation_type,
+            ).first()
+            
+            if not existing_rel:
+                relation = models.KnowledgeRelation(
+                    kb_id=kb_id,
+                    source_id=source.id,
+                    target_id=target.id,
+                    relation_type=relation_type,
+                    description=rel_data.get("description"),
+                    weight=rel_data.get("weight", 1),
+                )
+                db.add(relation)
+                created_relations.append(relation)
+    
+    db.commit()
+    
+    return {
+        "entities_created": len(created_entities),
+        "relations_created": len(created_relations),
+        "total_entities": len(entity_map),
+    }
+
+
+def get_knowledge_graph_stats(db: Session, kb_id: Optional[int] = None) -> dict:
+    """获取知识图谱统计信息"""
+    entity_query = db.query(models.KnowledgeEntity)
+    relation_query = db.query(models.KnowledgeRelation)
+    
+    if kb_id is not None:
+        entity_query = entity_query.filter(models.KnowledgeEntity.kb_id == kb_id)
+        relation_query = relation_query.filter(models.KnowledgeRelation.kb_id == kb_id)
+    
+    entity_count = entity_query.count()
+    relation_count = relation_query.count()
+    
+    # 统计实体类型分布
+    type_stats = {}
+    if entity_count > 0:
+        from sqlalchemy import func
+        type_counts = db.query(
+            models.KnowledgeEntity.entity_type,
+            func.count(models.KnowledgeEntity.id)
+        )
+        if kb_id is not None:
+            type_counts = type_counts.filter(models.KnowledgeEntity.kb_id == kb_id)
+        type_counts = type_counts.group_by(models.KnowledgeEntity.entity_type).all()
+        type_stats = {t: c for t, c in type_counts}
+    
+    return {
+        "entity_count": entity_count,
+        "relation_count": relation_count,
+        "entity_types": type_stats,
+    }

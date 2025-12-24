@@ -24,7 +24,7 @@ from app.db.database import SessionLocal, engine, Base
 from app.db import crud, models
 from app.ai.ai_manager import AIManager
 from app.ai import tools as ai_tools
-from app.utils.logger import logger, log_api_call
+from app.utils.logger import logger, log_api_call, chat_logger
 from app.utils.context_manager import ContextManager
 
 load_dotenv()
@@ -55,7 +55,18 @@ def get_db():
         db.close()
 
 
+def parse_bool(value: Optional[Any]) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 ai_manager = AIManager()
+
 
 
 # ========== 基础接口 ==========
@@ -125,8 +136,28 @@ def create_conversation(
     model: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
+    """
+    创建新对话：
+    - 若最新对话没有任何消息，则复用该对话，避免无限新增空对话。
+    - 否则创建新对话。
+    返回字段：
+    - conversation: 对话信息
+    - reused: 是否复用了现有空对话
+    """
+    latest = crud.get_latest_conversation(db)
+    if latest:
+        msg_count = crud.get_conversation_message_count(db, latest.id)
+        if msg_count == 0:
+            # 复用最新的空对话
+            if title and title != latest.title:
+                latest = crud.update_conversation_title(db, latest.id, title)
+            if model and model != latest.model:
+                latest = crud.update_conversation_model(db, latest.id, model)
+            return {"conversation": latest.to_dict(), "reused": True}
+
     conv = crud.create_conversation(db, title=title, model=model)
-    return conv.to_dict()
+    return {"conversation": conv.to_dict(), "reused": False}
+
 
 
 @app.get("/conversations")
@@ -141,6 +172,43 @@ def delete_conversation(conversation_id: int, db: Session = Depends(get_db)):
     return {"success": True}
 
 
+@app.put("/conversations/{conversation_id}")
+def update_conversation(
+    conversation_id: int,
+    title: Optional[str] = Form(None),
+    model: Optional[str] = Form(None),
+    is_pinned: Optional[bool] = Form(None),
+    enable_knowledge_base: Optional[bool] = Form(None),
+    enable_mcp: Optional[bool] = Form(None),
+    enable_web_search: Optional[bool] = Form(None),
+    provider_id: Optional[int] = Form(None),
+    db: Session = Depends(get_db),
+):
+    conv = crud.get_conversation(db, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    if title is not None:
+        conv.title = title
+    if model is not None:
+        conv.model = model
+    if is_pinned is not None:
+        conv.is_pinned = parse_bool(is_pinned) or False
+    if enable_knowledge_base is not None:
+        conv.enable_knowledge_base = parse_bool(enable_knowledge_base) or False
+    if enable_mcp is not None:
+        conv.enable_mcp = parse_bool(enable_mcp) or False
+    if enable_web_search is not None:
+        conv.enable_web_search = parse_bool(enable_web_search) or False
+
+    if provider_id is not None:
+        conv.provider_id = provider_id
+
+    db.commit()
+    db.refresh(conv)
+    return conv.to_dict()
+
+
 @app.post("/conversations/{conversation_id}/title")
 def update_conversation_title(
     conversation_id: int,
@@ -153,10 +221,12 @@ def update_conversation_title(
     return conv.to_dict()
 
 
+
 @app.post("/conversations/{conversation_id}/auto-title")
 def auto_generate_conversation_title(
     conversation_id: int,
     model: Optional[str] = Form(None),
+    first_user_message: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
     """
@@ -170,11 +240,22 @@ def auto_generate_conversation_title(
     
     # 获取对话的前几条消息用于生成标题
     messages_db = crud.get_messages(db, conversation_id)
-    if len(messages_db) < 2:  # 至少需要一轮对话
+    # 如果数据库中消息太少，但前端传来了 first_user_message，则把它作为最小上下文
+    if len(messages_db) < 2 and not first_user_message:
         raise HTTPException(status_code=400, detail="对话内容不足，无法生成标题")
-    
+
     # 取前4条消息作为上下文
     context_messages = messages_db[:4]
+    if len(context_messages) < 2 and first_user_message:
+        # 创建一个临时的用户消息对象样式用于生成标题
+        class _TmpMsg:
+            def __init__(self, role, content):
+                self.role = role
+                self.content = content
+
+        tmp = _TmpMsg('user', first_user_message)
+        # 把临时消息插到最前面
+        context_messages = [tmp] + context_messages
     context_text = "\n".join([f"{m.role}: {m.content[:200]}" for m in context_messages])  # 限制每条消息长度
     
     # 构建标题生成的提示
@@ -196,11 +277,20 @@ def auto_generate_conversation_title(
         print(f"配置Provider for conversation {conversation_id}")
         _configure_ai_provider_for_conversation(db, conversation)
         
-        # 确定使用的模型
-        use_model = model or conversation.model or settings.AI_MODEL
+        # 确定使用的模型：优先参数，其次设置中的 auto_title_model，再次会话/全局默认
+        selected_model = model
+        if not selected_model:
+            setting_model = crud.get_setting(db, "auto_title_model")
+            if setting_model and setting_model.value and setting_model.value != "current":
+                selected_model = setting_model.value
+        if not selected_model:
+            selected_model = conversation.model or settings.AI_MODEL
+
+        use_model = selected_model
         print(f"使用模型: {use_model}")
         
         # 调用AI生成标题
+
         title_messages = [{"role": "user", "content": title_prompt}]
         print(f"调用AI生成标题...")
         
@@ -247,7 +337,9 @@ def update_conversation_pin(
     is_pinned: bool = Form(...),
     db: Session = Depends(get_db),
 ):
+    is_pinned = bool(parse_bool(is_pinned))
     conv = crud.update_conversation_pin(db, conversation_id, is_pinned)
+
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return conv.to_dict()
@@ -274,6 +366,10 @@ def update_conversation_features(
     enable_web_search: Optional[bool] = Form(None),
     db: Session = Depends(get_db),
 ):
+    enable_knowledge_base = parse_bool(enable_knowledge_base)
+    enable_mcp = parse_bool(enable_mcp)
+    enable_web_search = parse_bool(enable_web_search)
+
     conv = crud.update_conversation_features(
         db,
         conversation_id,
@@ -281,6 +377,7 @@ def update_conversation_features(
         enable_mcp=enable_mcp,
         enable_web_search=enable_web_search,
     )
+
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return conv.to_dict()
@@ -290,13 +387,23 @@ def update_conversation_features(
 @app.post("/conversations/{conversation_id}/provider")
 def set_conversation_provider(
     conversation_id: int,
-    provider_id: Optional[int] = Form(None),
+    provider_id: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
-    conv = crud.set_conversation_provider(db, conversation_id, provider_id)
+    parsed_provider: Optional[int]
+    if provider_id in (None, "", "null", "undefined"):
+        parsed_provider = None
+    else:
+        try:
+            parsed_provider = int(provider_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid provider_id")
+
+    conv = crud.set_conversation_provider(db, conversation_id, parsed_provider)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
     return conv.to_dict()
+
 
 
 # ========== 消息与聊天 ==========
@@ -445,7 +552,7 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], conversatio
         
         elif function_name == "web_search":
             query = function_args.get("query", "")
-            source = function_args.get("source", "bing")
+            source = function_args.get("source", "duckduckgo")
             return ai_tools.run_web_search_tool(query=query, source=source)
         
         else:
@@ -509,6 +616,11 @@ def chat_with_conversation(
 ):
     from datetime import datetime
     start_time = datetime.now()
+
+    enable_knowledge_base = parse_bool(enable_knowledge_base)
+    enable_mcp = parse_bool(enable_mcp)
+    enable_web_search = parse_bool(enable_web_search)
+    stream = parse_bool(stream) or False
     
     # 记录聊天请求
     tools_enabled = {
@@ -516,6 +628,7 @@ def chat_with_conversation(
         "mcp": enable_mcp,
         "web_search": enable_web_search
     }
+
     logger.log_chat_request(conversation_id, user_text, model, tools_enabled)
     
     conversation = crud.get_conversation(db, conversation_id)
@@ -558,7 +671,7 @@ def chat_with_conversation(
         else conversation.enable_web_search
     )
     if web_flag:
-        search_source = web_search_source or "bing"
+        search_source = web_search_source or "duckduckgo"
         system_prompt = f"如需查询最新信息、实时数据或当前事件，请调用 web_search 工具。默认搜索源为 {search_source}。"
         messages.insert(0, {"role": "system", "content": system_prompt})
 
@@ -671,6 +784,9 @@ def chat_with_conversation(
         accumulated = []
         token_info = None
         
+        # 记录流式输出开始
+        chat_logger.info(f"[STREAM] 开始流式输出，对话ID: {conversation_id}, 模型: {model}")
+        
         # 首先发送 ack 事件，确认用户消息已保存
         yield f"event: ack\n"
         yield f"data: {{\"user_message_id\": {user_msg.id}}}\n\n"
@@ -678,50 +794,79 @@ def chat_with_conversation(
         if use_tools:
             # 流式 + tools：执行工具调用并流式返回
             try:
+                chat_logger.info(f"[STREAM] 使用工具模式")
                 # 执行带工具的对话，包括工具调用循环
                 content, token_info = _execute_chat_with_tools(
                     messages, tools_list, model, conversation_id, db
                 )
                 
-                # 逐字符流式返回
-                for char in content:
-                    accumulated.append(char)
-                    yield f"data: {char}\n\n"
+                chat_logger.info(f"[STREAM] 工具调用完成，内容长度: {len(content)}")
+                
+                # 流式返回：按块发送 JSON，保留换行等格式
+                import json as _json
+                chunk_size = 512
+                chunk_count = 0
+                for i in range(0, len(content), chunk_size):
+                    chunk = content[i : i + chunk_size]
+                    payload = _json.dumps({"text": chunk}, ensure_ascii=False)
+                    accumulated.append(chunk)
+                    chunk_count += 1
+                    yield f"data: {payload}\n\n"
+                
+                chat_logger.info(f"[STREAM] 发送完成，共 {chunk_count} 个块")
                 
                 # 发送token信息
                 yield f"event: meta\n"
                 yield f"data: {json.dumps(token_info)}\n\n"
                 yield "data: [DONE]\n\n"
                 
+                chat_logger.info(f"[STREAM] 发送 [DONE] 标记")
+                
                 # 写入数据库
                 full_text = "".join(accumulated)
+
+                try:
+                    logger.log_token_usage(
+                        model=token_info.get("model", model or "default"),
+                        input_tokens=token_info.get("input_tokens", 0),
+                        output_tokens=token_info.get("output_tokens", 0),
+                        total_tokens=token_info.get("total_tokens", 0),
+                        estimated=token_info.get("estimated", False),
+                    )
+                except Exception:
+                    pass
                 crud.create_message(db, conversation_id, "assistant", full_text, token_info)
                 
             except Exception as e:
+                chat_logger.error(f"[STREAM] 工具模式错误: {str(e)}")
                 yield f"data: [错误] {str(e)}\n\n"
                 yield "data: [DONE]\n\n"
+
         else:
             try:
-                # 普通流式对话
-                for delta in ai_manager.chat(messages, model=model, stream=True):
-                    accumulated.append(delta)
-                    yield f"data: {delta}\n\n"
+                chat_logger.info(f"[STREAM] 普通流式模式")
+                chunk_count = 0
+                # 普通流式对话，直接消费 include_usage 终结包
+                for chunk in ai_manager.chat(messages, model=model, stream=True):
+                    if isinstance(chunk, dict):
+                        if chunk.get("type") == "usage":
+                            token_info = chunk.get("usage")
+                            continue
+                        delta = chunk.get("content", "")
+                    else:
+                        delta = str(chunk)
+
+                    if delta:
+                        accumulated.append(delta)
+                        chunk_count += 1
+                        # 使用 JSON 编码以保留换行符（SSE 中换行符会破坏格式）
+                        yield f"data: {json.dumps(delta, ensure_ascii=False)}\n\n"
                 
-                # 流式完成后，获取token统计
                 full_text = "".join(accumulated)
-                
-                # 尝试获取实际的token统计
-                try:
-                    # 调用一次非流式获取准确的token统计
-                    result = ai_manager.chat(messages, model=model, stream=False)
-                    token_info = {
-                        "model": result.get("model", model or "default"),
-                        "input_tokens": result.get("input_tokens", 0),
-                        "output_tokens": result.get("output_tokens", 0),
-                        "total_tokens": result.get("total_tokens", 0)
-                    }
-                except:
-                    # 如果获取失败，使用估算
+                chat_logger.info(f"[STREAM] 流式输出完成，共 {chunk_count} 个块，总长度: {len(full_text)}")
+
+                # 如果流式没给 usage，则估算
+                if not token_info:
                     estimated_input = max(1, len(json.dumps(messages, ensure_ascii=False)) // 4)
                     estimated_output = max(1, len(full_text) // 4)
                     token_info = {
@@ -729,20 +874,35 @@ def chat_with_conversation(
                         "input_tokens": estimated_input,
                         "output_tokens": estimated_output,
                         "total_tokens": estimated_input + estimated_output,
-                        "estimated": True
+                        "estimated": True,
                     }
-                
+
                 # 发送token信息
                 yield f"event: meta\n"
                 yield f"data: {json.dumps(token_info)}\n\n"
                 yield "data: [DONE]\n\n"
                 
+                chat_logger.info(f"[STREAM] 发送 [DONE] 标记")
+                
                 # 完成后将完整回复写入数据库
+                try:
+                    logger.log_token_usage(
+                        model=token_info.get("model", model or "default"),
+                        input_tokens=token_info.get("input_tokens", 0),
+                        output_tokens=token_info.get("output_tokens", 0),
+                        total_tokens=token_info.get("total_tokens", 0),
+                        estimated=token_info.get("estimated", False),
+                    )
+                except Exception:
+                    pass
+
                 crud.create_message(db, conversation_id, "assistant", full_text, token_info)
                 
             except Exception as e:
+                chat_logger.error(f"[STREAM] 普通模式错误: {str(e)}")
                 yield f"data: [错误] {str(e)}\n\n"
                 yield "data: [DONE]\n\n"
+
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -975,22 +1135,25 @@ def list_knowledge_documents(
 @app.post("/knowledge/upload")
 def upload_knowledge_file(
     kb_id: Optional[int] = Form(None),
-    embedding_model: Optional[str] = Form(None),  # 新增：用户选择的向量模型
+    embedding_model: Optional[str] = Form(None),
+    extract_graph: Optional[bool] = Form(True),  # 新增：是否提取知识图谱
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
     """
     上传一个文件到指定知识库：
     1. 保存原始文件；
-    2. 抽取文本（当前简单读为 utf-8 文本，后续可加 PDF/Docx 解析）；
+    2. 抽取文本；
     3. 切分为若干段落；
     4. 调用 embedding 接口生成向量；
-    5. 存入 KnowledgeDocument + KnowledgeChunk。
+    5. 存入 KnowledgeDocument + KnowledgeChunk；
+    6. （可选）提取知识图谱实体和关系。
     """
     # 验证向量模型
     selected_embedding_model = embedding_model or settings.EMBEDDING_MODEL
-    if selected_embedding_model not in settings.embedding_models:
-        raise HTTPException(status_code=400, detail=f"不支持的向量模型: {selected_embedding_model}")
+    if selected_embedding_model and selected_embedding_model not in settings.embedding_models:
+        # 如果没有配置向量模型，跳过向量化
+        selected_embedding_model = None
     
     # 1. 保存文件
     kb_dir = os.path.join(UPLOAD_DIR, "knowledge")
@@ -1004,10 +1167,9 @@ def upload_knowledge_file(
         with open(save_path, "r", encoding="utf-8") as f:
             content = f.read()
     except UnicodeDecodeError:
-        # 若不是纯文本，可以在这里接 PDF/Docx 解析逻辑；当前简单返回错误
         raise HTTPException(status_code=400, detail="暂不支持非 UTF-8 文本文件作为知识库源。")
 
-    # 3. 简单切分段落（按行/固定长度）
+    # 3. 简单切分段落
     paragraphs: List[str] = []
     for line in content.splitlines():
         line = line.strip()
@@ -1018,10 +1180,14 @@ def upload_knowledge_file(
     if not paragraphs:
         raise HTTPException(status_code=400, detail="文件中未检测到有效文本内容。")
 
-    # 4. 生成向量（使用指定的向量模型）
-    embeddings = ai_manager.create_embedding(paragraphs, model=selected_embedding_model)
-    if not embeddings or len(embeddings) != len(paragraphs):
-        raise HTTPException(status_code=500, detail="向量生成失败，请检查大模型配置。")
+    # 4. 生成向量（如果有向量模型）
+    embeddings = None
+    if selected_embedding_model:
+        try:
+            embeddings = ai_manager.create_embedding(paragraphs, model=selected_embedding_model)
+        except Exception as e:
+            print(f"向量生成失败: {e}")
+            embeddings = None
 
     # 5. 写入 DB
     doc = crud.create_knowledge_document(
@@ -1029,16 +1195,49 @@ def upload_knowledge_file(
         kb_id=kb_id,
         file_name=file.filename,
         file_path=save_path,
-        content=content[:2000],  # 可选：存一部分摘要
-        embedding_model=selected_embedding_model,  # 记录使用的向量模型
+        content=content[:2000],
+        embedding_model=selected_embedding_model,
     )
 
-    chunks_data = []
-    for idx, (para, emb) in enumerate(zip(paragraphs, embeddings)):
-        chunks_data.append((idx, para, emb))
-    crud.create_knowledge_chunks(db, document_id=doc.id, chunks=chunks_data)
+    # 存储向量块
+    if embeddings and len(embeddings) == len(paragraphs):
+        chunks_data = []
+        for idx, (para, emb) in enumerate(zip(paragraphs, embeddings)):
+            chunks_data.append((idx, para, emb))
+        crud.create_knowledge_chunks(db, document_id=doc.id, chunks=chunks_data)
 
-    return {"success": True, "document": doc.to_dict()}
+    # 6. 提取知识图谱（可选）
+    graph_result = None
+    if extract_graph:
+        try:
+            from app.ai.knowledge_graph import extract_from_chunks
+            
+            # 使用前几个段落提取实体关系
+            sample_chunks = paragraphs[:20]  # 限制处理量
+            entities, relations = extract_from_chunks(
+                sample_chunks, 
+                ai_manager,
+                batch_size=5
+            )
+            
+            if entities or relations:
+                graph_result = crud.batch_create_entities_and_relations(
+                    db,
+                    kb_id=kb_id,
+                    document_id=doc.id,
+                    entities=entities,
+                    relations=relations,
+                )
+        except Exception as e:
+            print(f"知识图谱提取失败: {e}")
+            graph_result = {"error": str(e)}
+
+    return {
+        "success": True, 
+        "document": doc.to_dict(),
+        "chunks_count": len(paragraphs) if embeddings else 0,
+        "graph": graph_result,
+    }
 
 
 # ========== 系统设置接口（新增） ==========
@@ -1053,9 +1252,8 @@ def get_settings(db: Session = Depends(get_db)):
     return {
         "font_size": settings_dict.get("font_size", "13px"),
         "auto_title_model": settings_dict.get("auto_title_model", "current"),
-        "default_search_source": settings_dict.get("default_search_source", "bing"),
+        "default_search_source": settings_dict.get("default_search_source", "duckduckgo"),
         "tavily_api_key": settings_dict.get("tavily_api_key", ""),
-        "bing_api_key": settings_dict.get("bing_api_key", ""),  # 添加bing_api_key
         "global_api_key": settings_dict.get("global_api_key", getattr(settings, 'AI_API_KEY', '')),
         "global_api_base": settings_dict.get("global_api_base", getattr(settings, 'AI_API_BASE', 'https://api.openai.com/v1')),
         "global_default_model": settings_dict.get("global_default_model", getattr(settings, 'AI_MODEL', 'gpt-4o-mini')),
@@ -1070,7 +1268,6 @@ def update_settings(
     language: Optional[str] = Form(None),
     default_search_source: Optional[str] = Form(None),
     tavily_api_key: Optional[str] = Form(None),
-    bing_api_key: Optional[str] = Form(None),  # 修正参数名
     global_api_key: Optional[str] = Form(None),
     global_api_base: Optional[str] = Form(None),
     global_default_model: Optional[str] = Form(None),
@@ -1098,9 +1295,6 @@ def update_settings(
     if tavily_api_key is not None:  # 允许空字符串
         crud.set_setting(db, "tavily_api_key", tavily_api_key)
         settings_data["tavily_api_key"] = tavily_api_key
-    if bing_api_key is not None:  # 允许空字符串，修正字段名
-        crud.set_setting(db, "bing_api_key", bing_api_key)
-        settings_data["bing_api_key"] = bing_api_key
     
     # 新增：全局API配置
     if global_api_key is not None:
@@ -1127,30 +1321,102 @@ def update_settings(
     return {"success": True, "settings": settings_data}
 
 
+@app.get("/logs/export")
+def export_logs(hours: int = 24):
+    """导出日志文件"""
+    import zipfile
+    import io
+    from datetime import datetime, timedelta
+    from pathlib import Path
+    
+    logs_dir = Path("logs")
+    if not logs_dir.exists():
+        raise HTTPException(status_code=404, detail="日志目录不存在")
+    
+    cutoff_time = datetime.now() - timedelta(hours=hours)
+    
+    # 创建内存中的 ZIP 文件
+    zip_buffer = io.BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # 添加系统信息
+        import platform
+        system_info = {
+            "timestamp": datetime.now().isoformat(),
+            "platform": platform.platform(),
+            "python_version": platform.python_version(),
+            "hours_collected": hours
+        }
+        zipf.writestr("system_info.json", json.dumps(system_info, indent=2, ensure_ascii=False))
+        
+        # 收集日志文件
+        log_files = ["main.log", "api.log", "chat.log", "token.log", "database.log", "error.log"]
+        collected_count = 0
+        
+        for log_file in log_files:
+            log_path = logs_dir / log_file
+            if not log_path.exists():
+                continue
+            
+            try:
+                with open(log_path, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                
+                # 过滤最近的日志
+                recent_lines = []
+                for line in lines:
+                    try:
+                        if len(line) > 19:
+                            timestamp_str = line[:19]
+                            log_time = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                            if log_time >= cutoff_time:
+                                recent_lines.append(line)
+                    except:
+                        recent_lines.append(line)
+                
+                if recent_lines:
+                    zipf.writestr(f"logs/{log_file}", ''.join(recent_lines))
+                    collected_count += 1
+            except Exception:
+                pass
+        
+        # 添加说明文件
+        readme = f"""日志导出
+生成时间: {datetime.now().isoformat()}
+收集范围: 最近 {hours} 小时
+文件数量: {collected_count}
+"""
+        zipf.writestr("README.txt", readme)
+    
+    zip_buffer.seek(0)
+    
+    # 生成文件名
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"debug_logs_{timestamp}.zip"
+    
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
 @app.post("/search/test")
 def test_search_connection(
     source: str = Form(...),
     query: str = Form("test search"),
-    bing_api_key: Optional[str] = Form(None),
     tavily_api_key: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
     """测试搜索API连接"""
     try:
-        if source == "bing":
-            if not bing_api_key:
-                # 尝试从数据库获取
-                bing_api_key = crud.get_setting(db, "bing_api_key")
-                if not bing_api_key:
-                    raise HTTPException(status_code=400, detail="请提供Bing API Key")
-            
-            # 测试Bing搜索
+        if source == "duckduckgo":
+            # DuckDuckGo 不需要 API Key，直接测试
             import requests
-            headers = {"Ocp-Apim-Subscription-Key": bing_api_key}
-            params = {"q": query, "count": 1}
+            params = {"q": query, "format": "json"}
             response = requests.get(
-                "https://api.bing.microsoft.com/v7.0/search",
-                headers=headers,
+                "https://api.duckduckgo.com/",
                 params=params,
                 timeout=10
             )
@@ -1158,18 +1424,18 @@ def test_search_connection(
             
         elif source == "tavily":
             if not tavily_api_key:
-                # 尝试从数据库获取
-                tavily_api_key = crud.get_setting(db, "tavily_api_key")
+                setting = crud.get_setting(db, "tavily_api_key")
+                tavily_api_key = setting.value if setting else None
                 if not tavily_api_key:
                     raise HTTPException(status_code=400, detail="请提供Tavily API Key")
             
-            # 测试Tavily搜索
             import requests
             payload = {
                 "api_key": tavily_api_key,
                 "query": query,
                 "max_results": 1
             }
+
             response = requests.post(
                 "https://api.tavily.com/search",
                 json=payload,
@@ -1411,6 +1677,172 @@ def get_mcp_server_tools(server_id: int, db: Session = Depends(get_db)):
     }
 
 
+# ========== 知识图谱接口 ==========
+
+@app.get("/knowledge/graph/stats")
+def get_knowledge_graph_stats(
+    kb_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    """获取知识图谱统计信息"""
+    stats = crud.get_knowledge_graph_stats(db, kb_id)
+    return stats
+
+
+@app.get("/knowledge/graph/entities")
+def list_knowledge_entities(
+    kb_id: Optional[int] = None,
+    entity_type: Optional[str] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    """列出知识图谱实体"""
+    entities = crud.list_entities(db, kb_id=kb_id, entity_type=entity_type, limit=limit)
+    return [e.to_dict() for e in entities]
+
+
+@app.get("/knowledge/graph/entities/search")
+def search_knowledge_entities(
+    query: str,
+    kb_id: Optional[int] = None,
+    limit: int = 10,
+    db: Session = Depends(get_db),
+):
+    """搜索知识图谱实体"""
+    entities = crud.search_entities(db, query, kb_id=kb_id, limit=limit)
+    return [e.to_dict() for e in entities]
+
+
+@app.get("/knowledge/graph/entities/{entity_id}")
+def get_knowledge_entity(
+    entity_id: int,
+    db: Session = Depends(get_db),
+):
+    """获取单个实体详情"""
+    entity = crud.get_entity(db, entity_id)
+    if not entity:
+        raise HTTPException(status_code=404, detail="实体不存在")
+    return entity.to_dict()
+
+
+@app.get("/knowledge/graph/entities/{entity_id}/relations")
+def get_entity_relations(
+    entity_id: int,
+    max_depth: int = 2,
+    db: Session = Depends(get_db),
+):
+    """获取实体的关系网络"""
+    entity = crud.get_entity(db, entity_id)
+    if not entity:
+        raise HTTPException(status_code=404, detail="实体不存在")
+    
+    related = crud.get_related_entities(db, entity_id, max_depth=max_depth)
+    
+    return {
+        "entity": entity.to_dict(),
+        "related": [
+            {
+                "entity": item["entity"].to_dict(),
+                "relation": item["relation"].to_dict(),
+                "depth": item["depth"],
+            }
+            for item in related
+        ]
+    }
+
+
+@app.get("/knowledge/graph/relations")
+def list_knowledge_relations(
+    kb_id: Optional[int] = None,
+    entity_id: Optional[int] = None,
+    relation_type: Optional[str] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    """列出知识图谱关系"""
+    relations = crud.list_relations(
+        db, 
+        kb_id=kb_id, 
+        entity_id=entity_id, 
+        relation_type=relation_type, 
+        limit=limit
+    )
+    return [r.to_dict() for r in relations]
+
+
+@app.post("/knowledge/graph/entities")
+def create_knowledge_entity(
+    kb_id: Optional[int] = Form(None),
+    name: str = Form(...),
+    entity_type: str = Form(...),
+    description: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """手动创建实体"""
+    entity = crud.create_entity(
+        db,
+        kb_id=kb_id,
+        name=name,
+        entity_type=entity_type,
+        description=description,
+    )
+    return entity.to_dict()
+
+
+@app.post("/knowledge/graph/relations")
+def create_knowledge_relation(
+    kb_id: Optional[int] = Form(None),
+    source_id: int = Form(...),
+    target_id: int = Form(...),
+    relation_type: str = Form(...),
+    description: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """手动创建关系"""
+    # 验证实体存在
+    source = crud.get_entity(db, source_id)
+    target = crud.get_entity(db, target_id)
+    if not source or not target:
+        raise HTTPException(status_code=404, detail="源实体或目标实体不存在")
+    
+    relation = crud.create_relation(
+        db,
+        kb_id=kb_id,
+        source_id=source_id,
+        target_id=target_id,
+        relation_type=relation_type,
+        description=description,
+    )
+    return relation.to_dict()
+
+
+@app.delete("/knowledge/graph/entities/{entity_id}")
+def delete_knowledge_entity(entity_id: int, db: Session = Depends(get_db)):
+    """删除实体（会级联删除相关关系）"""
+    crud.delete_entity(db, entity_id)
+    return {"success": True}
+
+
+@app.delete("/knowledge/graph/relations/{relation_id}")
+def delete_knowledge_relation(relation_id: int, db: Session = Depends(get_db)):
+    """删除关系"""
+    crud.delete_relation(db, relation_id)
+    return {"success": True}
+
+
+@app.get("/knowledge/graph/context")
+def get_graph_context(
+    query: str,
+    kb_id: Optional[int] = None,
+    max_entities: int = 5,
+    db: Session = Depends(get_db),
+):
+    """基于查询获取知识图谱上下文（用于增强 RAG）"""
+    from app.ai.knowledge_graph import search_graph_context
+    context = search_graph_context(db, query, kb_id=kb_id, max_entities=max_entities)
+    return {"context": context}
+
+
 @app.get("/knowledge/embedding-models")
 def get_embedding_models(db: Session = Depends(get_db)):
     """获取可用的向量模型列表 - 基于用户配置的Provider"""
@@ -1443,6 +1875,55 @@ def get_embedding_models(db: Session = Depends(get_db)):
     return {
         "default": settings.EMBEDDING_MODEL if settings.EMBEDDING_MODEL in embedding_models else list(embedding_models)[0],
         "models": sorted(list(embedding_models)),
+    }
+
+
+@app.get("/models/vision")
+def get_vision_models(db: Session = Depends(get_db)):
+    """获取可用的视觉模型列表"""
+    # 获取所有Provider
+    providers = crud.list_providers(db)
+    
+    # 收集所有Provider中的视觉模型
+    vision_models = set()
+    
+    # 从Provider中提取视觉模型
+    for provider in providers:
+        if provider.models:
+            provider_models = [m.strip() for m in provider.models.split(",") if m.strip()]
+            # 过滤出视觉模型（通常包含vision关键字或特定模型名）
+            for model in provider_models:
+                model_lower = model.lower()
+                if "vision" in model_lower or "gpt-4o" in model_lower or "claude-3" in model_lower:
+                    vision_models.add(model)
+    
+    return {
+        "default": list(vision_models)[0] if vision_models else None,
+        "models": sorted(list(vision_models)),
+    }
+
+
+@app.get("/models/rerank")
+def get_rerank_models(db: Session = Depends(get_db)):
+    """获取可用的重排模型列表"""
+    # 获取所有Provider
+    providers = crud.list_providers(db)
+    
+    # 收集所有Provider中的重排模型
+    rerank_models = set()
+    
+    # 从Provider中提取重排模型
+    for provider in providers:
+        if provider.models:
+            provider_models = [m.strip() for m in provider.models.split(",") if m.strip()]
+            # 过滤出重排模型（通常包含rerank关键字）
+            for model in provider_models:
+                if "rerank" in model.lower():
+                    rerank_models.add(model)
+    
+    return {
+        "default": list(rerank_models)[0] if rerank_models else None,
+        "models": sorted(list(rerank_models)),
     }
 
 
@@ -1485,6 +1966,15 @@ def get_js():
         raise HTTPException(status_code=404, detail="JavaScript file not found")
     return FileResponse(frontend_path, media_type="application/javascript")
 
+@app.get("/markdown.js")
+def get_markdown_js():
+    # 返回Markdown渲染JavaScript文件
+    frontend_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "markdown.js")
+    frontend_path = os.path.abspath(frontend_path)
+    if not os.path.exists(frontend_path):
+        raise HTTPException(status_code=404, detail="Markdown JavaScript file not found")
+    return FileResponse(frontend_path, media_type="application/javascript")
+
 @app.get("/favicon.ico")
 def get_favicon():
     # 返回favicon文件
@@ -1495,3 +1985,65 @@ def get_favicon():
         from fastapi.responses import Response
         return Response(content="", media_type="image/x-icon")
     return FileResponse(frontend_path, media_type="image/x-icon")
+
+@app.get("/render-logger.js")
+def get_render_logger_js():
+    # 返回渲染日志JavaScript文件
+    frontend_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "render-logger.js")
+    frontend_path = os.path.abspath(frontend_path)
+    if not os.path.exists(frontend_path):
+        raise HTTPException(status_code=404, detail="Render logger JavaScript file not found")
+    return FileResponse(frontend_path, media_type="application/javascript")
+
+# 前端日志接收API
+@app.post("/api/frontend-log")
+async def receive_frontend_log(log_entry: dict):
+    """接收前端日志并写入文件"""
+    import datetime
+    log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
+    log_file = os.path.join(log_dir, "frontend-render.log")
+    
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        with open(log_file, "a", encoding="utf-8") as f:
+            timestamp = log_entry.get("timestamp", datetime.datetime.now().isoformat())
+            level = log_entry.get("level", "info").upper()
+            category = log_entry.get("category", "UNKNOWN")
+            message = log_entry.get("message", "")
+            data = log_entry.get("data", "")
+            session_id = log_entry.get("sessionId", "")
+            
+            log_line = f"{timestamp} [{level}][{category}][{session_id}] {message}"
+            if data:
+                log_line += f" | {data}"
+            f.write(log_line + "\n")
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/frontend-log/batch")
+async def receive_frontend_logs_batch(data: dict):
+    """批量接收前端日志"""
+    import datetime
+    log_dir = os.path.join(os.path.dirname(__file__), "..", "logs")
+    log_file = os.path.join(log_dir, "frontend-render.log")
+    
+    logs = data.get("logs", [])
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        with open(log_file, "a", encoding="utf-8") as f:
+            for log_entry in logs:
+                timestamp = log_entry.get("timestamp", datetime.datetime.now().isoformat())
+                level = log_entry.get("level", "info").upper()
+                category = log_entry.get("category", "UNKNOWN")
+                message = log_entry.get("message", "")
+                log_data = log_entry.get("data", "")
+                session_id = log_entry.get("sessionId", "")
+                
+                log_line = f"{timestamp} [{level}][{category}][{session_id}] {message}"
+                if log_data:
+                    log_line += f" | {log_data}"
+                f.write(log_line + "\n")
+        return {"status": "ok", "count": len(logs)}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}

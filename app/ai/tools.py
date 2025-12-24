@@ -104,55 +104,64 @@ def run_search_knowledge_tool(
     kb_id: Optional[int] = None,
     top_k: int = 5,
     embedding_fn=None,
+    use_graph: bool = True,  # 新增：是否使用知识图谱增强
 ) -> str:
     """
     知识库检索工具的实际执行逻辑：
 
     1. 使用 embedding_fn(query) 生成 query 向量；
     2. 用 crud.search_knowledge_chunks 在 DB 中做向量相似度检索；
-    3. 把检索到的 chunk 内容拼成一段说明文字返回给大模型。
+    3. （可选）从知识图谱中获取相关实体和关系；
+    4. 把检索到的内容拼成一段说明文字返回给大模型。
 
     embedding_fn: 一个函数，签名类似：
         embedding_fn([text: str]) -> List[List[float]]
     由调用方传入（通常是 AIManager.create_embedding）。
     """
-    if embedding_fn is None:
-        return "知识库检索工具未配置 embedding 函数，无法完成检索。"
-
-    # 1. 生成查询向量
-    embeddings = embedding_fn([query])
-    if not embeddings:
-        return "无法为当前查询生成向量。"
-    query_embedding = embeddings[0]
-
-    # 2. 从 DB 检索
+    parts: List[str] = []
     db: Session = SessionLocal()
+    
     try:
-        chunks = crud.search_knowledge_chunks(
-            db,
-            query_embedding=query_embedding,
-            kb_id=kb_id,
-            top_k=top_k,
-        )
+        # 1. 知识图谱检索（如果启用）
+        if use_graph:
+            try:
+                from app.ai.knowledge_graph import search_graph_context
+                graph_context = search_graph_context(db, query, kb_id=kb_id, max_entities=3)
+                if graph_context:
+                    parts.append(graph_context)
+            except Exception as e:
+                print(f"知识图谱检索失败: {e}")
+        
+        # 2. 向量检索
+        if embedding_fn is not None:
+            embeddings = embedding_fn([query])
+            if embeddings:
+                query_embedding = embeddings[0]
+                chunks = crud.search_knowledge_chunks(
+                    db,
+                    query_embedding=query_embedding,
+                    kb_id=kb_id,
+                    top_k=top_k,
+                )
+                
+                if chunks:
+                    parts.append("\n【向量检索结果】")
+                    for idx, chunk in enumerate(chunks, start=1):
+                        doc = chunk.document
+                        kb_name = doc.kb.name if doc and doc.kb else settings.KNOWLEDGE_DEFAULT_KB_NAME
+                        parts.append(
+                            textwrap.dedent(
+                                f"""
+                                [片段 {idx} | 知识库: {kb_name} | 文档: {doc.file_name if doc else '未知'}]
+                                {chunk.content}
+                                """
+                            ).strip()
+                        )
     finally:
         db.close()
 
-    if not chunks:
+    if not parts:
         return "知识库中没有找到与当前问题足够相关的内容。"
-
-    # 3. 拼接检索结果
-    parts: List[str] = []
-    for idx, chunk in enumerate(chunks, start=1):
-        doc = chunk.document
-        kb_name = doc.kb.name if doc and doc.kb else settings.KNOWLEDGE_DEFAULT_KB_NAME
-        parts.append(
-            textwrap.dedent(
-                f"""
-                [片段 {idx} | 知识库: {kb_name} | 文档: {doc.file_name if doc else '未知'}]
-                {chunk.content}
-                """
-            ).strip()
-        )
 
     return "\n\n".join(parts)
 
@@ -177,9 +186,9 @@ def web_search_tool_schema() -> Dict[str, Any]:
                     },
                     "source": {
                         "type": "string",
-                        "description": "搜索源，可选值：bing（必应搜索）或 tavily（Tavily搜索）",
-                        "enum": ["bing", "tavily"],
-                        "default": "bing"
+                        "description": "搜索源：duckduckgo（免费，默认）、tavily（需API Key）",
+                        "enum": ["duckduckgo", "tavily"],
+                        "default": "duckduckgo"
                     },
                 },
                 "required": ["query"],
@@ -188,95 +197,136 @@ def web_search_tool_schema() -> Dict[str, Any]:
     }
 
 
-def _search_with_bing(query: str, db_session=None) -> str:
+def _search_with_duckduckgo(query: str) -> str:
     """
-    使用必应搜索API
+    使用 DuckDuckGo 搜索（免费，无需 API Key）
     """
     import requests
-    from app.core.config import settings
-    from app.db.database import SessionLocal
-    from app.db import crud
+    import json
     
     try:
-        # 优先从数据库获取API Key
-        bing_api_key = None
-        if db_session:
-            bing_api_key = crud.get_setting(db_session, "bing_search_api_key")
-        
-        # 如果数据库没有，使用配置文件
-        if not bing_api_key:
-            bing_api_key = getattr(settings, 'BING_SEARCH_API_KEY', None)
-        
-        if not bing_api_key:
-            return f"搜索关键词：{query}\n\n由于未配置Bing Search API Key，无法执行实际搜索。\n\n建议：\n1. 在设置中配置Bing Search API Key\n2. 或使用Tavily搜索\n3. 手动搜索关键词：{query}"
-        
-        # Bing Search API调用
-        url = "https://api.bing.microsoft.com/v7.0/search"
-        headers = {
-            'Ocp-Apim-Subscription-Key': bing_api_key,
-            'Content-Type': 'application/json'
-        }
+        # DuckDuckGo Instant Answer API
+        url = "https://api.duckduckgo.com/"
         params = {
             'q': query,
-            'count': 5,
-            'offset': 0,
-            'mkt': 'zh-CN',
-            'safesearch': 'Moderate'
+            'format': 'json',
+            'no_html': 1,
+            'skip_disambig': 1
         }
         
-        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response = requests.get(url, params=params, timeout=10)
         if response.status_code == 200:
             data = response.json()
-            web_pages = data.get("webPages", {}).get("value", [])
             
-            if not web_pages:
-                return f"搜索关键词：{query}\n\n未找到相关结果。"
-            
-            # 格式化搜索结果为JSON结构
             results = []
-            for page in web_pages[:3]:  # 只取前3个结果
+            
+            # 获取摘要答案
+            if data.get("Abstract"):
                 results.append({
-                    "title": page.get("name", "无标题"),
-                    "url": page.get("url", ""),
-                    "snippet": page.get("snippet", "无内容")
+                    "title": data.get("Heading", "摘要"),
+                    "url": data.get("AbstractURL", ""),
+                    "snippet": data.get("Abstract", "")
                 })
             
-            import json
+            # 获取相关主题
+            for topic in data.get("RelatedTopics", [])[:3]:
+                if isinstance(topic, dict) and topic.get("Text"):
+                    results.append({
+                        "title": topic.get("Text", "")[:50] + "...",
+                        "url": topic.get("FirstURL", ""),
+                        "snippet": topic.get("Text", "")
+                    })
+            
+            if not results:
+                # 如果 Instant Answer 没有结果，使用 HTML 搜索作为备选
+                return _search_duckduckgo_html(query)
+            
             return json.dumps({
                 "query": query,
-                "source": "bing",
-                "results": results
+                "source": "duckduckgo",
+                "results": results[:3]
             }, ensure_ascii=False, indent=2)
         else:
-            return f"Bing搜索失败，状态码: {response.status_code}"
+            return _search_duckduckgo_html(query)
             
     except Exception as e:
-        return f"Bing搜索失败: {str(e)}"
+        return f"DuckDuckGo搜索失败: {str(e)}"
 
 
-def _search_with_tavily(query: str, db_session=None) -> str:
+def _search_duckduckgo_html(query: str) -> str:
     """
-    使用Tavily搜索
+    DuckDuckGo HTML 搜索备选方案
     """
     import requests
-    from app.core.config import settings
-    from app.db.database import SessionLocal
-    from app.db import crud
+    import json
+    import re
     
     try:
-        # 优先从数据库获取API Key
+        url = "https://html.duckduckgo.com/html/"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        data = {'q': query}
+        
+        response = requests.post(url, headers=headers, data=data, timeout=10)
+        if response.status_code == 200:
+            html = response.text
+            
+            # 简单解析结果
+            results = []
+            # 匹配结果链接和标题
+            pattern = r'<a rel="nofollow" class="result__a" href="([^"]+)"[^>]*>([^<]+)</a>'
+            matches = re.findall(pattern, html)
+            
+            # 匹配摘要
+            snippet_pattern = r'<a class="result__snippet"[^>]*>([^<]+)</a>'
+            snippets = re.findall(snippet_pattern, html)
+            
+            for i, (url, title) in enumerate(matches[:3]):
+                snippet = snippets[i] if i < len(snippets) else ""
+                results.append({
+                    "title": title.strip(),
+                    "url": url,
+                    "snippet": snippet.strip()
+                })
+            
+            if results:
+                return json.dumps({
+                    "query": query,
+                    "source": "duckduckgo",
+                    "results": results
+                }, ensure_ascii=False, indent=2)
+            else:
+                return f"搜索关键词：{query}\n\n未找到相关结果。"
+        else:
+            return f"DuckDuckGo搜索失败，状态码: {response.status_code}"
+            
+    except Exception as e:
+        return f"DuckDuckGo搜索失败: {str(e)}"
+
+
+def _search_with_tavily(query: str) -> str:
+    """
+    使用 Tavily 搜索（需要 API Key）
+    """
+    import requests
+    import json
+    
+    try:
+        # 从数据库获取 API Key
         tavily_api_key = None
-        if db_session:
-            tavily_api_key = crud.get_setting(db_session, "tavily_api_key")
+        try:
+            db = SessionLocal()
+            setting = crud.get_setting(db, "tavily_api_key")
+            tavily_api_key = setting.value if setting else None
+            db.close()
+        except:
+            pass
         
-        # 如果数据库没有，使用配置文件
         if not tavily_api_key:
-            tavily_api_key = getattr(settings, 'TAVILY_API_KEY', None)
+            return f"未配置 Tavily API Key，已自动切换到 DuckDuckGo 搜索。\n\n" + _search_with_duckduckgo(query)
         
-        if not tavily_api_key:
-            return f"搜索关键词：{query}\n\n由于未配置Tavily API Key，无法执行实际搜索。\n\n建议：\n1. 在设置中配置Tavily API Key\n2. 或使用必应搜索\n3. 手动搜索关键词：{query}"
-        
-        # Tavily API调用
+        # Tavily API 调用
         url = "https://api.tavily.com/search"
         payload = {
             "api_key": tavily_api_key,
@@ -296,16 +346,14 @@ def _search_with_tavily(query: str, db_session=None) -> str:
             if not results:
                 return f"搜索关键词：{query}\n\n未找到相关结果。"
             
-            # 格式化搜索结果为JSON结构
             formatted_results = []
-            for result in results[:3]:  # 只取前3个结果
+            for result in results[:3]:
                 formatted_results.append({
                     "title": result.get("title", "无标题"),
                     "url": result.get("url", ""),
-                    "snippet": result.get("content", "无内容")[:200] + "..."
+                    "snippet": result.get("content", "无内容")[:200]
                 })
             
-            import json
             return json.dumps({
                 "query": query,
                 "source": "tavily",
@@ -321,156 +369,22 @@ def _search_with_tavily(query: str, db_session=None) -> str:
 def run_web_search_tool(
     *,
     query: str,
-    source: str = "bing",
+    source: str = "duckduckgo",
     db_session=None,
 ) -> str:
     """
-    联网搜索工具的实际执行逻辑：
-    
-    1. 根据source参数选择搜索引擎
-    2. 执行搜索并返回结果
+    联网搜索工具的实际执行逻辑
     """
     try:
-        if source == "bing":
-            return _search_with_bing(query)
+        if source == "duckduckgo":
+            return _search_with_duckduckgo(query)
         elif source == "tavily":
             return _search_with_tavily(query)
         else:
-            return f"不支持的搜索源: {source}"
+            # 默认使用 DuckDuckGo
+            return _search_with_duckduckgo(query)
     except Exception as e:
         return f"搜索失败: {str(e)}"
-
-
-def _search_with_bing(query: str) -> str:
-    """
-    使用必应搜索API
-    """
-    import requests
-    from app.core.config import settings
-    
-    try:
-        # 优先从数据库获取API Key，其次从环境变量
-        bing_api_key = None
-        try:
-            db = SessionLocal()
-            bing_api_key = crud.get_setting(db, "bing_api_key")
-            db.close()
-        except:
-            pass
-        
-        if not bing_api_key:
-            bing_api_key = getattr(settings, 'BING_SEARCH_API_KEY', None)
-        
-        if not bing_api_key:
-            return f"搜索关键词：{query}\n\n由于未配置Bing Search API Key，无法执行实际搜索。\n\n建议：\n1. 在设置中配置Bing Search API Key\n2. 或使用Tavily搜索\n3. 手动搜索关键词：{query}"
-        
-        # Bing Search API调用
-        url = "https://api.bing.microsoft.com/v7.0/search"
-        headers = {
-            'Ocp-Apim-Subscription-Key': bing_api_key,
-            'Content-Type': 'application/json'
-        }
-        params = {
-            'q': query,
-            'count': 5,
-            'offset': 0,
-            'mkt': 'zh-CN',
-            'safesearch': 'Moderate'
-        }
-        
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            web_pages = data.get("webPages", {}).get("value", [])
-            
-            if not web_pages:
-                return f"搜索关键词：{query}\n\n未找到相关结果。"
-            
-            # 格式化搜索结果为JSON结构
-            results = []
-            for page in web_pages[:3]:  # 只取前3个结果
-                results.append({
-                    "title": page.get("name", "无标题"),
-                    "url": page.get("url", ""),
-                    "snippet": page.get("snippet", "无内容")
-                })
-            
-            import json
-            return json.dumps({
-                "query": query,
-                "source": "bing",
-                "results": results
-            }, ensure_ascii=False, indent=2)
-        else:
-            return f"Bing搜索失败，状态码: {response.status_code}"
-            
-    except Exception as e:
-        return f"Bing搜索失败: {str(e)}"
-
-
-def _search_with_tavily(query: str) -> str:
-    """
-    使用Tavily搜索
-    """
-    import requests
-    from app.core.config import settings
-    
-    try:
-        # 优先从数据库获取API Key，其次从环境变量
-        tavily_api_key = None
-        try:
-            db = SessionLocal()
-            tavily_api_key = crud.get_setting(db, "tavily_api_key")
-            db.close()
-        except:
-            pass
-        
-        if not tavily_api_key:
-            tavily_api_key = getattr(settings, 'TAVILY_API_KEY', None)
-        
-        if not tavily_api_key:
-            return f"搜索关键词：{query}\n\n由于未配置Tavily API Key，无法执行实际搜索。\n\n建议：\n1. 在设置中配置Tavily API Key\n2. 或使用必应搜索\n3. 手动搜索关键词：{query}"
-        
-        # Tavily API调用
-        url = "https://api.tavily.com/search"
-        payload = {
-            "api_key": tavily_api_key,
-            "query": query,
-            "search_depth": "basic",
-            "include_answer": True,
-            "include_images": False,
-            "include_raw_content": False,
-            "max_results": 5
-        }
-        
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            results = data.get("results", [])
-            
-            if not results:
-                return f"搜索关键词：{query}\n\n未找到相关结果。"
-            
-            # 格式化搜索结果为JSON结构
-            formatted_results = []
-            for result in results[:3]:  # 只取前3个结果
-                formatted_results.append({
-                    "title": result.get("title", "无标题"),
-                    "url": result.get("url", ""),
-                    "snippet": result.get("content", "无内容")[:200] + "..."
-                })
-            
-            import json
-            return json.dumps({
-                "query": query,
-                "source": "tavily",
-                "results": formatted_results
-            }, ensure_ascii=False, indent=2)
-        else:
-            return f"Tavily搜索失败，状态码: {response.status_code}"
-            
-    except Exception as e:
-        return f"Tavily搜索失败: {str(e)}"
 
 
 # 统一对外接口：根据开关组合返回工具列表 -----------------------------
@@ -490,8 +404,6 @@ def get_tools(
     """
     tools: List[Dict[str, Any]] = []
 
-    # 只有在明确启用时才添加工具，不再默认添加任何工具
-    
     # 知识库工具
     if enable_knowledge_base:
         tools.append(search_knowledge_tool_schema())
@@ -500,9 +412,8 @@ def get_tools(
     if enable_web_search:
         tools.append(web_search_tool_schema())
 
-    # MCP 工具（预留，你之后可以在这里 append MCP 相关工具 schema）
+    # MCP 工具（预留）
     if enable_mcp:
-        # tools.append(...)
         pass
 
     return tools

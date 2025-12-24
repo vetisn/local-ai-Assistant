@@ -276,3 +276,96 @@ class SystemSetting(Base):
     value = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ========= 新增：知识图谱相关模型 =========
+
+class KnowledgeEntity(Base):
+    """知识图谱实体表"""
+    __tablename__ = "knowledge_entities"
+
+    id = Column(Integer, primary_key=True, index=True)
+    kb_id = Column(Integer, ForeignKey("knowledge_bases.id"), nullable=True, index=True)
+    document_id = Column(Integer, ForeignKey("knowledge_documents.id"), nullable=True, index=True)
+    
+    name = Column(String(255), nullable=False, index=True)  # 实体名称
+    entity_type = Column(String(100), nullable=False, index=True)  # 实体类型：人物、概念、技术、组织等
+    description = Column(Text, nullable=True)  # 实体描述
+    properties = Column(Text, nullable=True)  # JSON格式的额外属性
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # 关系
+    kb = relationship("KnowledgeBase", backref="entities")
+    document = relationship("KnowledgeDocument", backref="entities")
+    
+    # 作为源实体的关系
+    outgoing_relations = relationship(
+        "KnowledgeRelation",
+        foreign_keys="KnowledgeRelation.source_id",
+        back_populates="source",
+        cascade="all, delete-orphan"
+    )
+    # 作为目标实体的关系
+    incoming_relations = relationship(
+        "KnowledgeRelation",
+        foreign_keys="KnowledgeRelation.target_id",
+        back_populates="target",
+        cascade="all, delete-orphan"
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "kb_id": self.kb_id,
+            "document_id": self.document_id,
+            "name": self.name,
+            "entity_type": self.entity_type,
+            "description": self.description,
+            "properties": self.properties,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class KnowledgeRelation(Base):
+    """知识图谱关系表"""
+    __tablename__ = "knowledge_relations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    kb_id = Column(Integer, ForeignKey("knowledge_bases.id"), nullable=True, index=True)
+    
+    source_id = Column(Integer, ForeignKey("knowledge_entities.id"), nullable=False, index=True)
+    target_id = Column(Integer, ForeignKey("knowledge_entities.id"), nullable=False, index=True)
+    
+    relation_type = Column(String(100), nullable=False, index=True)  # 关系类型：依赖、包含、属于、使用等
+    description = Column(Text, nullable=True)  # 关系描述
+    weight = Column(Integer, default=1)  # 关系权重/强度
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # 关系
+    kb = relationship("KnowledgeBase", backref="relations")
+    source = relationship(
+        "KnowledgeEntity",
+        foreign_keys=[source_id],
+        back_populates="outgoing_relations"
+    )
+    target = relationship(
+        "KnowledgeEntity",
+        foreign_keys=[target_id],
+        back_populates="incoming_relations"
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "kb_id": self.kb_id,
+            "source_id": self.source_id,
+            "target_id": self.target_id,
+            "source_name": self.source.name if self.source else None,
+            "target_name": self.target.name if self.target else None,
+            "relation_type": self.relation_type,
+            "description": self.description,
+            "weight": self.weight,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }

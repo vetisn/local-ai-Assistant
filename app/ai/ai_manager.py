@@ -134,8 +134,11 @@ class AIManager:
             "messages": messages,
             "stream": stream,
         }
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
         
         # 记录详细的API调用信息
+
         try:
             logger.log_ai_api_call(
                 api_base=self._provider.api_base,
@@ -189,32 +192,45 @@ class AIManager:
         # 流式：返回一个生成器
         resp = self._post("chat/completions", payload, stream=True)
 
-        def _iter() -> Generator[str, None, None]:
+        def _iter() -> Generator[Dict[str, Any], None, None]:
+            usage_info = None
             try:
                 for line in resp.iter_lines():
                     if not line:
                         continue
-                    # 修复：iter_lines() 返回 str，所以这里不能用 b"data:"
                     if line.startswith("data:"):
-                        line = line[5:].strip()  # len("data:") == 5
+                        line = line[5:].strip()
                     if line == "[DONE]":
                         break
                     try:
-                        # httpx.Response(..., content=str) 也能正常解析 json
                         obj = httpx.Response(200, content=line).json()
                     except Exception:
                         continue
+
+                    # usage 终结包
+                    usage = obj.get("usage")
+                    if usage:
+                        usage_info = {
+                            "model": payload["model"],
+                            "input_tokens": usage.get("prompt_tokens", 0),
+                            "output_tokens": usage.get("completion_tokens", 0),
+                            "total_tokens": usage.get("total_tokens", 0),
+                        }
+                        yield {"type": "usage", "usage": usage_info}
+                        continue
+
                     choices = obj.get("choices") or []
                     if not choices:
                         continue
                     delta = choices[0].get("delta") or {}
                     content = delta.get("content") or ""
                     if content:
-                        yield content
+                        yield {"type": "content", "content": content}
             finally:
                 resp.close()
 
         return _iter()
+
 
     def run_with_tools(
         self,
@@ -235,8 +251,11 @@ class AIManager:
         }
         if tools:
             payload["tools"] = tools
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
 
         if not stream:
+
             resp = self._post("chat/completions", payload, stream=False)
             try:
                 data = resp.json()

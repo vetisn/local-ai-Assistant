@@ -30,7 +30,6 @@ class Settings(BaseSettings):
 
     # 搜索API配置
     TAVILY_API_KEY: str = ""
-    BING_SEARCH_API_KEY: str = ""
 
     @property
     def embedding_models(self) -> List[str]:
