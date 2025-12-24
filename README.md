@@ -32,7 +32,7 @@
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/your-repo/local-ai-assistant.git
+git clone https://github.com/vetisn/local-ai-assistant.git
 cd local-ai-assistant
 ```
 
@@ -213,4 +213,5 @@ MIT License
 ---
 
 **声明**：本项目大部分代码由 AI 辅助完成，仅供学习和研究使用。
+
 
