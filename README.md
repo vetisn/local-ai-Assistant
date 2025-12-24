@@ -154,7 +154,6 @@ python start.py
 ├── uploads/                # 上传文件目录
 ├── .env                    # 环境变量配置
 ├── start.py                # 启动脚本
-├── check_deps.py           # 依赖检查
 ├── collect_logs.py         # 日志收集
 └── requirements.txt        # Python 依赖
 ```
@@ -214,3 +213,4 @@ MIT License
 ---
 
 **声明**：本项目大部分代码由 AI 辅助完成，仅供学习和研究使用。
+
