@@ -93,9 +93,10 @@ class AIManager:
         path: str,
         json_data: Dict[str, Any],
         stream: bool = False,
+        timeout: int = 60,
     ) -> httpx.Response:
         url = f"{self._provider.api_base}/{path.lstrip('/')}"
-        client_args: Dict[str, Any] = {"timeout": 60}
+        client_args: Dict[str, Any] = {"timeout": timeout}
         if stream:
             client_args["timeout"] = None  # 流式需要长连接
 
@@ -107,6 +108,9 @@ class AIManager:
             resp = client.send(request, stream=stream)
             resp.raise_for_status()
             return resp
+        except httpx.HTTPStatusError as e:
+            client.close()
+            raise
         except Exception:
             client.close()
             raise
@@ -118,11 +122,13 @@ class AIManager:
         messages: List[Dict[str, str]],
         model: Optional[str] = None,
         stream: bool = False,
+        enable_thinking: bool = False,  # 新增：是否启用深度思考
     ) -> Any:
         """
         普通聊天调用。
         - 当 stream=False 时，返回包含内容和token统计的字典。
         - 当 stream=True 时，返回生成器，yield 文本增量。
+        - enable_thinking=True 时，启用深度思考模式（需要模型支持）
         """
         payload: Dict[str, Any] = {
             "model": model or self._provider.default_model,
@@ -131,6 +137,28 @@ class AIManager:
         }
         if stream:
             payload["stream_options"] = {"include_usage": True}
+        
+        # 深度思考模式配置
+        # 注意：不同的 API 提供商可能有不同的参数格式
+        if enable_thinking:
+            model_name = (model or self._provider.default_model or "").lower()
+            
+            # Gemini 模型使用 Google 的格式
+            if "gemini" in model_name:
+                # Google Gemini 通过 OpenAI 兼容 API 的思考模式
+                # 参考: https://ai.google.dev/gemini-api/docs/openai
+                payload["reasoning_effort"] = "medium"
+                # 注意：某些中转 API 可能不支持 thinking 参数，先注释掉
+                # payload["thinking"] = {"type": "enabled", "budget_tokens": 10000}
+            elif "deepseek" in model_name or "r1" in model_name:
+                # DeepSeek R1 模型
+                payload["reasoning_effort"] = "medium"
+            elif "o1" in model_name or "o3" in model_name:
+                # OpenAI o1/o3 模型
+                payload["reasoning_effort"] = "medium"
+            else:
+                # 其他模型尝试通用格式
+                payload["reasoning_effort"] = "medium"
         
         # 记录详细的API调用信息
 
@@ -143,16 +171,15 @@ class AIManager:
             )
             
             # 记录消息内容（用于调试token使用）
-            total_chars = sum(len(msg.get('content', '')) for msg in messages)
+            total_chars = sum(len(msg.get('content') or '') for msg in messages)
             logger.log_performance("消息准备", 0, {
                 "messages_count": len(messages),
                 "total_characters": total_chars,
                 "average_chars_per_message": total_chars / len(messages) if messages else 0
             })
             
-        except Exception as e:
-            # 日志记录失败不应该影响主要功能
-            print(f"日志记录失败: {e}")
+        except Exception:
+            pass
         
         if not stream:
             resp = self._post("chat/completions", payload, stream=False)
@@ -177,8 +204,8 @@ class AIManager:
                         output_tokens=result["output_tokens"],
                         total_tokens=result["total_tokens"]
                     )
-                except Exception as e:
-                    print(f"Token日志记录失败: {e}")
+                except Exception:
+                    pass
                 
                 return result
             finally:
@@ -189,49 +216,78 @@ class AIManager:
 
         def _iter() -> Generator[Dict[str, Any], None, None]:
             usage_info = None
-            line_count = 0
             try:
                 for line in resp.iter_lines():
-                    line_count += 1
                     if not line:
                         continue
-                    # 调试：打印原始行
-                    if line_count <= 5:
-                        print(f"[DEBUG] 流式行 {line_count}: {line[:200] if len(line) > 200 else line}")
                     
                     if line.startswith("data:"):
                         line = line[5:].strip()
                     if line == "[DONE]":
-                        print(f"[DEBUG] 收到 [DONE]，共 {line_count} 行")
+                        # 在结束前 yield 最后收集到的 usage 信息
+                        if usage_info:
+                            yield {"type": "usage", "usage": usage_info}
                         break
                     try:
                         import json as _json
                         obj = _json.loads(line)
-                    except Exception as e:
-                        print(f"[DEBUG] JSON解析失败: {e}, 行内容: {line[:100]}")
+                    except Exception:
                         continue
 
-                    # usage 终结包
+                    # usage 信息（持续更新，在流结束时 yield）
                     usage = obj.get("usage")
-                    if usage:
+                    if usage and usage.get("prompt_tokens"):
                         usage_info = {
                             "model": payload["model"],
                             "input_tokens": usage.get("prompt_tokens", 0),
                             "output_tokens": usage.get("completion_tokens", 0),
                             "total_tokens": usage.get("total_tokens", 0),
                         }
-                        yield {"type": "usage", "usage": usage_info}
-                        continue
 
                     choices = obj.get("choices") or []
                     if not choices:
                         continue
                     delta = choices[0].get("delta") or {}
+                    
+                    # 检查是否有思考内容（深度思考模式）
+                    # 支持多种格式：reasoning_content, thinking, 或 <thought> 标签
+                    reasoning = delta.get("reasoning_content") or delta.get("thinking") or ""
                     content = delta.get("content") or ""
+                    
+                    # 如果 content 为空但 reasoning 有内容，需要判断这是真正的思考还是最终回复
+                    # DeepSeek 模型有时会把最终回复也放在 reasoning_content 中
+                    if reasoning and not content:
+                        # 先作为思考内容输出
+                        yield {"type": "thinking", "content": reasoning}
+                    elif reasoning and content:
+                        # 两者都有，分别输出
+                        yield {"type": "thinking", "content": reasoning}
+                    
+                    # Gemini 的思考内容可能包裹在 <thought> 标签中
+                    if content:
+                        # 检查是否包含 <thought> 标签
+                        if "<thought>" in content or "</thought>" in content:
+                            # 提取思考内容
+                            import re
+                            thought_match = re.search(r'<thought>(.*?)</thought>', content, re.DOTALL)
+                            if thought_match:
+                                thinking_text = thought_match.group(1)
+                                yield {"type": "thinking", "content": thinking_text}
+                                # 移除思考内容，保留正文
+                                content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL)
+                            elif "<thought>" in content and "</thought>" not in content:
+                                # 思考开始但未结束，整个内容都是思考
+                                thinking_text = content.replace("<thought>", "")
+                                yield {"type": "thinking", "content": thinking_text}
+                                content = ""
+                            elif "</thought>" in content and "<thought>" not in content:
+                                # 思考结束
+                                thinking_text = content.replace("</thought>", "")
+                                yield {"type": "thinking", "content": thinking_text}
+                                content = ""
+                    
                     if content:
                         yield {"type": "content", "content": content}
-                
-                print(f"[DEBUG] 流式迭代结束，共处理 {line_count} 行")
             finally:
                 resp.close()
 
@@ -261,8 +317,8 @@ class AIManager:
             payload["stream_options"] = {"include_usage": True}
 
         if not stream:
-
-            resp = self._post("chat/completions", payload, stream=False)
+            # 工具调用模式需要更长的超时时间（120秒）
+            resp = self._post("chat/completions", payload, stream=False, timeout=120)
             try:
                 data = resp.json()
                 # 格式化返回数据，确保包含token信息

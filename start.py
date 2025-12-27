@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-启动脚本
+启动脚本 - 一键启动本地AI助手
+首次运行前请先安装依赖: pip install -r requirements.txt
 """
 
 import os
 import sys
-import uvicorn
+
 
 def initialize_database():
     """初始化数据库（仅在需要时）"""
@@ -26,6 +27,7 @@ def initialize_database():
         print(f"❌ 数据库初始化失败: {e}")
         return False
 
+
 if __name__ == "__main__":
     print("🚀 启动本地AI助手...")
     
@@ -37,6 +39,7 @@ if __name__ == "__main__":
     print("📚 API文档: http://localhost:8000/docs")
     print("⏹️  按 Ctrl+C 停止服务")
     
+    import uvicorn
     try:
         uvicorn.run(
             "app.main:app",

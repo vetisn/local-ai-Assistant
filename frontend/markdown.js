@@ -15,16 +15,19 @@
 
         _init() {
             if (typeof marked !== 'undefined') {
-                marked.setOptions({ gfm: true, breaks: true });
+                marked.setOptions({ 
+                    gfm: true, 
+                    breaks: true,
+                    // 允许中文字符紧邻 ** 也能正确解析粗体
+                    pedantic: false
+                });
                 this.ready = true;
-                console.log('[MD] marked.js 初始化成功');
             } else {
                 console.warn('[MD] marked.js 未加载，将使用纯文本模式');
             }
             
             if (typeof katex !== 'undefined') {
                 this.katexReady = true;
-                console.log('[MD] KaTeX 初始化成功');
             } else {
                 console.warn('[MD] KaTeX 未加载，数学公式将不渲染');
             }
@@ -37,7 +40,6 @@
             }
             if (!this.katexReady && typeof katex !== 'undefined') {
                 this.katexReady = true;
-                console.log('[MD] KaTeX 延迟初始化成功');
             }
             return this.ready;
         }
@@ -57,6 +59,14 @@
                 return placeholder;
             });
             
+            // 保护 \[ ... \] 块级公式
+            text = text.replace(/\\\[([\s\S]+?)\\\]/g, (match, formula) => {
+                const placeholder = `%%MATH_BLOCK_${index}%%`;
+                formulas.push({ placeholder, formula: formula.trim(), display: true });
+                index++;
+                return placeholder;
+            });
+            
             // 保护 $ ... $ 行内公式（不跨行，避免匹配货币符号）
             text = text.replace(/\$([^\$\n]+?)\$/g, (match, formula) => {
                 // 跳过看起来像货币的情况（如 $100）
@@ -65,6 +75,22 @@
                 }
                 const placeholder = `%%MATH_INLINE_${index}%%`;
                 formulas.push({ placeholder, formula: formula.trim(), display: false });
+                index++;
+                return placeholder;
+            });
+            
+            // 保护 \( ... \) 行内公式
+            text = text.replace(/\\\(([\s\S]+?)\\\)/g, (match, formula) => {
+                const placeholder = `%%MATH_INLINE_${index}%%`;
+                formulas.push({ placeholder, formula: formula.trim(), display: false });
+                index++;
+                return placeholder;
+            });
+            
+            // 处理独立的 LaTeX 命令（如 \sigma_m, \Delta K 等）
+            text = text.replace(/\\(alpha|beta|gamma|delta|epsilon|zeta|eta|theta|iota|kappa|lambda|mu|nu|xi|pi|rho|sigma|tau|upsilon|phi|chi|psi|omega|Alpha|Beta|Gamma|Delta|Epsilon|Zeta|Eta|Theta|Iota|Kappa|Lambda|Mu|Nu|Xi|Pi|Rho|Sigma|Tau|Upsilon|Phi|Chi|Psi|Omega|infty|partial|nabla|sum|prod|int|sqrt|frac|cdot|times|div|pm|mp|leq|geq|neq|approx|equiv|sim|propto|perp|parallel|angle|degree)(_\{[^}]+\}|_[a-zA-Z0-9]|\^\{[^}]+\}|\^[a-zA-Z0-9])*/g, (match) => {
+                const placeholder = `%%MATH_INLINE_${index}%%`;
+                formulas.push({ placeholder, formula: match, display: false });
                 index++;
                 return placeholder;
             });
@@ -119,17 +145,75 @@
 
         _doRender(el, md, isStreaming = false) {
             try {
-                // 先保护数学公式
-                const { text: protectedMd, formulas } = this._protectMath(md || '');
+                // 预处理：修复中文字符紧邻 ** 的情况
+                let processedMd = md || '';
                 
-                let html = marked.parse(protectedMd);
+                // 先保护数学公式
+                const { text: protectedMd, formulas } = this._protectMath(processedMd);
+                
+                // 保护 XML 工具调用标签（防止被当作 HTML 处理）
+                // 支持多种格式: <function_calls>, <| DSML | function_calls>, <function_calls> 等
+                processedMd = protectedMd;
+                const xmlToolCallPlaceholders = [];
+                let xmlIndex = 0;
+                
+                // 匹配 function_calls 标签的各种变体
+                processedMd = processedMd.replace(/<[\s\|]*(?:DSML\s*\|)?\s*(?:antml:)?(\/?)function_calls\s*>/gi, (match, slash) => {
+                    const placeholder = `%%XML_TOOL_${xmlIndex}%%`;
+                    xmlToolCallPlaceholders.push({ placeholder, original: match, isClose: !!slash });
+                    xmlIndex++;
+                    return placeholder;
+                });
+                
+                // 匹配 invoke 标签的各种变体
+                processedMd = processedMd.replace(/<[\s\|]*(?:DSML\s*\|)?\s*(?:antml:)?(\/?)invoke\s+/gi, (match, slash) => {
+                    const placeholder = `%%XML_INVOKE_${xmlIndex}%%`;
+                    xmlToolCallPlaceholders.push({ placeholder, original: match, isClose: !!slash });
+                    xmlIndex++;
+                    return placeholder;
+                });
+                
+                // 匹配 invoke 结束标签
+                processedMd = processedMd.replace(/<[\s\|]*(?:DSML\s*\|)?\s*(?:antml:)?\/invoke\s*>/gi, (match) => {
+                    const placeholder = `%%XML_INVOKE_END_${xmlIndex}%%`;
+                    xmlToolCallPlaceholders.push({ placeholder, original: match, isClose: true });
+                    xmlIndex++;
+                    return placeholder;
+                });
+                
+                // 匹配 parameter 标签的各种变体
+                processedMd = processedMd.replace(/<[\s\|]*(?:DSML\s*\|)?\s*(?:antml:)?(\/?)parameter\s+/gi, (match, slash) => {
+                    const placeholder = `%%XML_PARAM_${xmlIndex}%%`;
+                    xmlToolCallPlaceholders.push({ placeholder, original: match, isClose: !!slash });
+                    xmlIndex++;
+                    return placeholder;
+                });
+                
+                // 匹配 parameter 结束标签
+                processedMd = processedMd.replace(/<[\s\|]*(?:DSML\s*\|)?\s*(?:antml:)?\/parameter\s*>/gi, (match) => {
+                    const placeholder = `%%XML_PARAM_END_${xmlIndex}%%`;
+                    xmlToolCallPlaceholders.push({ placeholder, original: match, isClose: true });
+                    xmlIndex++;
+                    return placeholder;
+                });
+                
+                let html = marked.parse(processedMd);
+                
                 if (typeof DOMPurify !== 'undefined') {
-                    // 允许 KaTeX 生成的标签和属性
+                    // 允许 KaTeX 生成的标签和属性，以及自定义协议链接
                     html = DOMPurify.sanitize(html, {
                         ADD_TAGS: ['semantics', 'annotation', 'mrow', 'mi', 'mo', 'mn', 'msup', 'msub', 'mfrac', 'mroot', 'msqrt', 'mtext', 'mspace', 'mtable', 'mtr', 'mtd', 'mover', 'munder', 'munderover', 'math'],
-                        ADD_ATTR: ['xmlns', 'encoding', 'mathvariant', 'stretchy', 'fence', 'separator', 'accent', 'accentunder', 'columnalign', 'rowalign', 'columnspacing', 'rowspacing', 'columnlines', 'rowlines', 'frame', 'framespacing', 'equalrows', 'equalcolumns', 'displaystyle', 'lspace', 'rspace', 'movablelimits', 'largeop', 'symmetric', 'maxsize', 'minsize', 'scriptlevel', 'linethickness', 'notation', 'open', 'close', 'separators', 'bevelled', 'numalign', 'denomalign', 'actiontype', 'selection', 'href', 'mathbackground', 'mathcolor', 'mathsize', 'width', 'height', 'depth', 'voffset', 'align', 'side', 'minlabelspacing', 'groupalign', 'charalign', 'stackalign', 'charspacing', 'longdivstyle', 'position', 'shift', 'location', 'crossout', 'length', 'leftoverhang', 'rightoverhang', 'mslinethickness', 'decimalpoint', 'edge', 'indentalign', 'indentalignfirst', 'indentalignlast', 'indentshift', 'indentshiftfirst', 'indentshiftlast', 'indenttarget', 'linebreak', 'linebreakmultchar', 'linebreakstyle', 'lineleading', 'infixlinebreakstyle', 'class', 'style', 'aria-hidden']
+                        ADD_ATTR: ['xmlns', 'encoding', 'mathvariant', 'stretchy', 'fence', 'separator', 'accent', 'accentunder', 'columnalign', 'rowalign', 'columnspacing', 'rowspacing', 'columnlines', 'rowlines', 'frame', 'framespacing', 'equalrows', 'equalcolumns', 'displaystyle', 'lspace', 'rspace', 'movablelimits', 'largeop', 'symmetric', 'maxsize', 'minsize', 'scriptlevel', 'linethickness', 'notation', 'open', 'close', 'separators', 'bevelled', 'numalign', 'denomalign', 'actiontype', 'selection', 'href', 'mathbackground', 'mathcolor', 'mathsize', 'width', 'height', 'depth', 'voffset', 'align', 'side', 'minlabelspacing', 'groupalign', 'charalign', 'stackalign', 'charspacing', 'longdivstyle', 'position', 'shift', 'location', 'crossout', 'length', 'leftoverhang', 'rightoverhang', 'mslinethickness', 'decimalpoint', 'edge', 'indentalign', 'indentalignfirst', 'indentalignlast', 'indentshift', 'indentshiftfirst', 'indentshiftlast', 'indenttarget', 'linebreak', 'linebreakmultchar', 'linebreakstyle', 'lineleading', 'infixlinebreakstyle', 'class', 'style', 'aria-hidden', 'download', 'target', 'rel'],
+                        ADD_URI_SAFE_ATTR: ['href'],
+                        ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|sandbox|file):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i
                     });
                 }
+                
+                // 还原 XML 工具调用标签（转义显示）
+                xmlToolCallPlaceholders.forEach(item => {
+                    const escaped = item.original.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                    html = html.replace(item.placeholder, escaped);
+                });
                 
                 // 还原并渲染数学公式
                 html = this._restoreMath(html, formulas);
@@ -298,6 +382,8 @@
         }
 
         parse(md) {
+            // 确保初始化
+            this._ensureReady();
             if (!this.ready) return md;
             try {
                 // 先保护数学公式
@@ -307,7 +393,9 @@
                 if (typeof DOMPurify !== 'undefined') {
                     html = DOMPurify.sanitize(html, {
                         ADD_TAGS: ['semantics', 'annotation', 'mrow', 'mi', 'mo', 'mn', 'msup', 'msub', 'mfrac', 'mroot', 'msqrt', 'mtext', 'mspace', 'mtable', 'mtr', 'mtd', 'mover', 'munder', 'munderover', 'math'],
-                        ADD_ATTR: ['xmlns', 'encoding', 'mathvariant', 'stretchy', 'class', 'style', 'aria-hidden']
+                        ADD_ATTR: ['xmlns', 'encoding', 'mathvariant', 'stretchy', 'class', 'style', 'aria-hidden', 'href', 'download', 'target', 'rel'],
+                        ADD_URI_SAFE_ATTR: ['href'],
+                        ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|sandbox|file):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i
                     });
                 }
                 
@@ -331,6 +419,8 @@
         cancelRender: (el) => renderer.cancel(el),
         addCopyButtons: (container) => renderer.addCopyButtons(container),
         parse: (markdown) => renderer.parse(markdown),
+        // 兼容旧代码：render 作为 parse 的别名，返回 HTML 字符串
+        render: (markdown) => renderer.parse(markdown),
         isReady: () => renderer._ensureReady()
     };
 })();

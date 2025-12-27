@@ -93,6 +93,10 @@ def create_message(
     role: str,
     content: str,
     token_info: dict = None,
+    tool_calls: str = None,
+    thinking_content: str = None,
+    vision_content: str = None,
+    message_events: str = None,
 ) -> models.Message:
     message_data = {
         "conversation_id": conversation_id,
@@ -108,6 +112,18 @@ def create_message(
             "output_tokens": token_info.get("output_tokens"),
             "total_tokens": token_info.get("total_tokens")
         })
+    
+    # 保存消息事件流（新格式，优先使用）
+    if message_events:
+        message_data["message_events"] = message_events
+    
+    # 保存工具调用、深度思考内容和视觉识别内容（旧格式，兼容保留）
+    if tool_calls:
+        message_data["tool_calls"] = tool_calls
+    if thinking_content:
+        message_data["thinking_content"] = thinking_content
+    if vision_content:
+        message_data["vision_content"] = vision_content
     
     message = models.Message(**message_data)
     db.add(message)

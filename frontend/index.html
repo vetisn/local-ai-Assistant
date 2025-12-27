@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
@@ -12,7 +12,7 @@
     <link rel="stylesheet" href="lib/katex.min.css">
     
     <!-- 引入外部CSS -->
-    <link rel="stylesheet" href="style.css?v=144">
+    <link rel="stylesheet" href="style.css?v=172">
     
     <!-- Markdown解析 -->
     <script src="lib/marked.min.js"></script>
@@ -45,49 +45,73 @@
         </div>
     </div>
 
-    <div class="main-panel">
+    <div class="main-panel" id="main-panel">
+        <!-- 拖拽上传遮罩 -->
+        <div class="drop-overlay" id="drop-overlay">
+            <div class="drop-overlay-content">
+                <span class="drop-icon">📎</span>
+                <span class="drop-text">释放以上传文件</span>
+            </div>
+        </div>
+        
         <div class="chat-messages" id="chat-messages"></div>
+        
+        <!-- 已上传文件预览区 -->
+        <div class="uploaded-files-preview" id="uploaded-files-preview" style="display: none;">
+            <div class="uploaded-files-list" id="uploaded-files-list"></div>
+        </div>
+        
         <div class="chat-footer">
             <div class="chat-toolbar">
                 <div class="chat-toggles">
-                    <label title="知识库"><input type="checkbox" id="toggle-knowledge"><span>📚</span></label>
+                    <!-- 文件上传按钮 -->
+                    <label class="file-upload-label custom-tooltip " data-tooltip="上传文件">
+                        <input type="file" id="file-upload-input" multiple accept=".pdf,.docx,.doc,.txt,.md,.csv,.json,.xml,.html,.htm,.png,.jpg,.jpeg,.gif,.bmp,.webp" style="display: none;">
+                        <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                        </svg>
+                    </label>
+                    
+                    <label class="custom-tooltip " data-tooltip="知识库检索"><input type="checkbox" id="toggle-knowledge"><span>📚</span></label>
                     
                     <!-- MCP 工具选择 -->
                     <div class="toggle-with-popup" id="mcp-toggle-wrapper">
-                        <label title="MCP 工具"><input type="checkbox" id="toggle-mcp"><span>🔧</span></label>
+                        <label class="custom-tooltip " data-tooltip="MCP 工具"><input type="checkbox" id="toggle-mcp"><span>🔧</span></label>
                         <div class="toggle-popup" id="mcp-popup">
                             <div class="toggle-popup-title">选择 MCP 服务</div>
                             <div class="toggle-popup-options" id="mcp-options"></div>
                         </div>
                     </div>
                     
-                    <label title="联网搜索"><input type="checkbox" id="toggle-web"><span>🌐</span></label>
-                    <label title="流式输出"><input type="checkbox" id="toggle-stream" checked><span>⚡</span></label>
+                    <label class="custom-tooltip " data-tooltip="联网搜索"><input type="checkbox" id="toggle-web"><span>🌐</span></label>
+                    
+                    <!-- 深度思考开关 -->
+                    <div id="thinking-toggle-wrapper" style="display: none;">
+                        <label class="custom-tooltip " data-tooltip="深度思考"><input type="checkbox" id="toggle-thinking" checked><span>🧠</span></label>
+                    </div>
+                    
+                    <!-- 视觉识别开关（当模型不支持视觉时显示） -->
+                    <div id="vision-toggle-wrapper" style="display: none;">
+                        <label class="custom-tooltip " data-tooltip="视觉识别（使用视觉模型识别图片内容）"><input type="checkbox" id="toggle-vision-recognition"><span>👁️</span></label>
+                    </div>
                     
                     <!-- 生图模式 -->
-                    <div class="toggle-with-popup" id="image-gen-toggle-wrapper">
-                        <label title="生图模式"><input type="checkbox" id="toggle-image-gen"><span>🎨</span></label>
+                    <div class="toggle-with-popup" id="image-gen-toggle-wrapper" style="display: none;">
+                        <label class="custom-tooltip " data-tooltip="生图模式"><input type="checkbox" id="toggle-image-gen"><span>🎨</span></label>
                         <div class="toggle-popup" id="image-gen-popup">
                             <div class="toggle-popup-title">🎨 生图设置</div>
                             <div class="toggle-popup-options">
                                 <div class="image-gen-option">
-                                    <label>选择生图模型</label>
-                                    <select id="image-gen-model-select">
-                                        <option value="">请先配置生图模型</option>
-                                    </select>
-                                </div>
-                                <div class="image-gen-option">
                                     <label>图片尺寸</label>
-                                    <select id="image-gen-size-select">
-                                        <option value="1024x1024">1024 × 1024 (方形)</option>
-                                        <option value="1792x1024">1792 × 1024 (横向)</option>
-                                        <option value="1024x1792">1024 × 1792 (纵向)</option>
-                                        <option value="512x512">512 × 512 (小图)</option>
-                                    </select>
+                                    <div class="image-gen-size-inputs">
+                                        <input type="number" id="image-gen-width" value="1024" min="256" max="4096" step="64" placeholder="宽度">
+                                        <span>×</span>
+                                        <input type="number" id="image-gen-height" value="1024" min="256" max="4096" step="64" placeholder="高度">
+                                    </div>
                                 </div>
                             </div>
                             <div class="image-gen-tip">
-                                💡 开启后输入描述即可生图，需先在 Provider 中配置生图模型
+                                💡 开启后输入描述即可生图
                             </div>
                         </div>
                     </div>
@@ -106,7 +130,7 @@
                             </select>
                         </div>
                     </div>
-                    <select id="provider-select" title="选择Provider">
+                    <select id="provider-select" class="custom-tooltip " data-tooltip="选择Provider">
                         <option value="">未配置</option>
                     </select>
                 </div>
@@ -147,17 +171,30 @@
                 <div class="settings-section">
                     <h4>🤖 AI设置</h4>
                     <div class="settings-row">
-                        <label>自动命名模型</label>
+                        <label>
+                            默认对话模型
+                            <span class="help-icon custom-tooltip" data-tooltip="新对话时默认使用的模型。选择'记忆上次选择'则自动使用上次选择的模型">?</span>
+                        </label>
+                        <select id="default-chat-model-select">
+                            <option value="remember_last">记忆上次选择</option>
+                            <option value="">使用 Provider 默认模型</option>
+                        </select>
+                    </div>
+                    <div class="settings-row">
+                        <label>
+                            自动命名模型
+                            <span class="help-icon custom-tooltip" data-tooltip="新对话发送第一条消息后，将使用此模型自动生成对话标题。选择'使用当前对话模型'则使用对话中选择的模型">?</span>
+                        </label>
                         <select id="auto-title-model-select">
                             <option value="current">使用当前对话模型</option>
                         </select>
                     </div>
                     <div class="settings-row">
                         <label>
-                            图片识别方案
-                            <span class="help-tip" data-tip="当对话模型不支持图片时，用于识别图片中的文字。支持本地 Tesseract OCR（免费离线），安装后在下拉框中选择即可。安装指南见「知识库管理」页面">?</span>
+                            默认视觉模型
+                            <span class="help-icon custom-tooltip" data-tooltip="当对话模型不支持图片识别时，将使用此模型解析图片内容，&#10;再将结果发送给对话模型处理">?</span>
                         </label>
-                        <select id="ocr-method-select">
+                        <select id="default-vision-model-select">
                             <option value="">不启用</option>
                         </select>
                     </div>
@@ -224,7 +261,7 @@
                     <input type="hidden" id="provider-id">
                     <div class="form-row">
                         <label>名称 <span class="required">*</span></label>
-                        <input type="text" id="provider-name" required placeholder="如: OpenAI / 智谱AI">
+                        <input type="text" id="provider-name" required placeholder="如 OpenAI / 智谱AI">
                     </div>
                     <div class="form-row">
                         <label>API Base URL <span class="required">*</span></label>
@@ -253,9 +290,9 @@
                         </div>
                     </div>
                     
-                    <!-- 模型列表 -->
+                    <!-- 其他模型列表 -->
                     <div class="form-row">
-                        <label>模型列表</label>
+                        <label>其他模型列表</label>
                         <div id="provider-models-container" class="models-list-container">
                             <!-- 动态添加的模型卡片 -->
                         </div>
@@ -291,7 +328,7 @@
                     <form id="kb-form">
                         <div class="form-row">
                             <label>名称</label>
-                            <input type="text" id="kb-name" placeholder="如: 公司文档">
+                            <input type="text" id="kb-name" placeholder="如 公司文档">
                         </div>
                         <div class="form-row">
                             <label>描述</label>
@@ -305,17 +342,15 @@
                 <div class="kb-upload-container">
                     <h3>上传文档</h3>
                     <form id="kb-upload-form">
-                        <div class="form-row">
-                            <label>目标知识库</label>
-                            <select id="kb-select"></select>
-                        </div>
+                        <!-- 已有文件列表 -->
+                        <div id="kb-existing-files" class="kb-existing-files" style="display: none;"></div>
                         
                         <!-- 模型配置区域 -->
                         <div class="kb-model-config">
                             <div class="form-row">
                                 <label>
                                     向量模型 <span class="required-badge">必选</span>
-                                    <span class="model-help-icon" data-model-type="embedding" title="查看支持的模型">?</span>
+                                    <span class="help-icon custom-tooltip" data-tooltip="用于将文本转换为向量，支持 text-embedding-3-small 等模型">?</span>
                                 </label>
                                 <select id="embedding-model-select">
                                     <option value="">请选择向量模型</option>
@@ -326,7 +361,7 @@
                             <div class="form-row">
                                 <label>
                                     重排模型 <span class="optional-badge">可选</span>
-                                    <span class="model-help-icon" data-model-type="rerank" title="查看支持的模型">?</span>
+                                    <span class="help-icon custom-tooltip" data-tooltip="用于对检索结果重新排序，提高相关性，支持 rerank 类模型">?</span>
                                 </label>
                                 <select id="rerank-model-select">
                                     <option value="">不使用重排模型</option>
@@ -337,12 +372,12 @@
                             <div class="form-row">
                                 <label>
                                     图片识别方案 <span class="optional-badge">可选</span>
-                                    <span class="model-help-icon" data-model-type="vision" title="查看支持的模型">?</span>
+                                    <span class="help-icon custom-tooltip" data-tooltip="用于识别文档中的图片内容，支持视觉模型如 gpt-4o、gemini-pro-vision 等">?</span>
                                 </label>
                                 <select id="kb-vision-model-select">
                                     <option value="">不启用</option>
                                 </select>
-                                <small>识别扫描件/图片 PDF 中的文字</small>
+                                <small>识别扫描版/图片 PDF 中的文字</small>
                             </div>
                         </div>
                         
@@ -357,89 +392,27 @@
                         
                         <div class="form-row">
                             <label style="flex-direction: row; display: flex; align-items: center; gap: 8px;">
-                                <input type="checkbox" id="kb-extract-graph" checked style="width: auto;"> 
-                                自动提取知识图谱
+                                <input type="checkbox" id="kb-extract-images" style="width: auto;"> 
+                                提取文档内图片
+                                <span class="help-tip" data-tip="使用视觉模型识别PDF、Word、PPT中嵌入的图片内容。需要配置视觉模型，会增加处理时间和API调用成本。">?</span>
                             </label>
-                            <small>从文档中提取实体和关系，增强检索效果</small>
+                            <small>识别文档中的图片、图表、截图等内容（需配置视觉模型）</small>
                         </div>
                         
                         <div class="form-row">
                             <label>选择文件 - 支持多选</label>
-                            <input type="file" id="kb-file" multiple required accept=".pdf,.docx,.doc,.pptx,.xlsx,.xls,.txt,.md,.csv,.json,.xml,.html,.htm">
-                            <small>支持: PDF, Word, PPT, Excel, TXT, Markdown, CSV, JSON, XML, HTML</small>
+                            <input type="file" id="kb-file" multiple accept=".pdf,.docx,.doc,.pptx,.xlsx,.xls,.txt,.md,.csv,.json,.xml,.html,.htm,.png,.jpg,.jpeg,.gif,.bmp,.webp">
+                            <small>支持: PDF, Word, PPT, Excel, TXT, Markdown, CSV, JSON, XML, HTML, 图片</small>
                         </div>
+                        
+                        <!-- 已选文件列表 -->
+                        <div id="kb-file-list" class="kb-file-list" style="display: none;"></div>
+                        
                         <div class="form-actions">
-                            <button type="submit">上传并构建知识库</button>
+                            <button type="submit" id="kb-upload-btn">上传并构建知识库</button>
                         </div>
                     </form>
                     <div id="kb-upload-status" class="status-text"></div>
-                    
-                    <!-- 知识图谱统计 -->
-                    <div id="kb-graph-stats" style="margin-top: 15px; padding: 12px; background: #f5f5f5; border-radius: 6px; display: none;">
-                        <h4 style="margin: 0 0 8px 0; color: #333; font-size: 13px;">📊 知识图谱统计</h4>
-                        <div id="kb-graph-stats-content" style="font-size: 12px; color: #555;"></div>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- 下半部分：本地方案引导 -->
-            <div class="kb-local-solutions">
-                <h3 style="margin-bottom: 15px; color: #2c3e50;">🚀 本地方案（无需 API）</h3>
-                <div class="local-solution-cards">
-                    <!-- 本地 RAG MCP -->
-                    <div class="solution-card">
-                        <div class="solution-icon">📦</div>
-                        <div class="solution-content">
-                            <h4>本地 RAG MCP</h4>
-                            <p>完全本地运行的知识库检索，无需 API Key</p>
-                            <ul>
-                                <li>支持 PDF、DOCX、TXT、Markdown</li>
-                                <li>本地向量模型，离线可用</li>
-                                <li>语义搜索，理解自然语言</li>
-                            </ul>
-                            <div class="solution-code">
-                                <code>npx mcp-local-rag</code>
-                                <button type="button" class="copy-cmd-btn" data-cmd="npx mcp-local-rag">复制</button>
-                            </div>
-                            <a href="https://github.com/shinpr/mcp-local-rag" target="_blank" class="solution-link">查看文档 →</a>
-                        </div>
-                    </div>
-                    
-                    <!-- 本地 OCR -->
-                    <div class="solution-card">
-                        <div class="solution-icon">👁️</div>
-                        <div class="solution-content">
-                            <h4>本地 OCR（Tesseract）</h4>
-                            <p>识别扫描件/图片PDF中的文字，完全离线运行</p>
-                            <ul>
-                                <li>支持中英文等多语言识别</li>
-                                <li>开源免费，无API调用限制</li>
-                                <li>安装后在上方下拉框中选择即可使用</li>
-                            </ul>
-                            <div class="solution-steps">
-                                <div class="step-item">
-                                    <span class="step-num">1</span>
-                                    <span>下载 <a href="https://github.com/UB-Mannheim/tesseract/wiki" target="_blank">Tesseract 安装包</a>（Windows选64位）</span>
-                                </div>
-                                <div class="step-item">
-                                    <span class="step-num">2</span>
-                                    <span>安装时勾选 "Additional language data" → "Chinese Simplified"</span>
-                                </div>
-                                <div class="step-item">
-                                    <span class="step-num">3</span>
-                                    <span>安装完成后，将安装路径添加到系统环境变量 PATH</span>
-                                </div>
-                                <div class="step-item">
-                                    <span class="step-num">4</span>
-                                    <span>重启本应用，在"图片识别方案"下拉框中选择 Tesseract OCR</span>
-                                </div>
-                            </div>
-                            <small style="color: var(--text-muted); display: block; margin-top: 8px;">
-                                💡 验证安装：打开命令行输入 <code>tesseract --version</code>，显示版本号即安装成功
-                            </small>
-                            <a href="https://tesseract-ocr.github.io/tessdoc/Installation.html" target="_blank" class="solution-link">详细安装指南 →</a>
-                        </div>
-                    </div>
                 </div>
             </div>
         </div>
@@ -448,85 +421,60 @@
 
 <!-- MCP服务器管理弹窗 -->
 <div class="modal" id="mcp-modal">
-    <div class="modal-content">
+    <div class="modal-content modal-wide">
         <div class="modal-header">
-            <span class="modal-title">MCP服务器管理</span>
+            <span class="modal-title">🔌 MCP Server 管理</span>
             <button class="modal-close" data-target="mcp-modal" data-return="settings-modal">&times;</button>
         </div>
         <div class="modal-body">
+            <!-- 左侧：服务器列表 -->
             <div class="mcp-list-container">
-                <h3>已配置的MCP服务器</h3>
+                <h3>MCP Servers</h3>
                 <div id="mcp-list"></div>
+                <button type="button" id="mcp-add-btn" class="add-btn">+ 新建 MCP Server</button>
             </div>
+            
+            <!-- 右侧：编辑表单 -->
             <div class="mcp-form-container">
-                <h3>新建 / 编辑MCP服务器</h3>
+                <h3 id="mcp-form-title">编辑 MCP Server</h3>
                 <form id="mcp-form">
-                    <input type="hidden" id="mcp-id">
-                    <div class="form-row">
-                        <label>服务器名称</label>
-                        <input type="text" id="mcp-name" required placeholder="如: github-mcp">
+                    <input type="hidden" id="mcp-edit-name">
+                    <div class="form-row compact">
+                        <label>名称 <span class="required">*</span></label>
+                        <input type="text" id="mcp-name" required placeholder="如 office-mcp">
                     </div>
-                    <div class="form-row">
-                        <label>描述</label>
-                        <input type="text" id="mcp-description" placeholder="可选描述">
-                    </div>
-                    <div class="form-row">
-                        <label>连接类型</label>
-                        <select id="mcp-connection-type" required>
-                            <option value="">请选择连接类型</option>
-                            <option value="stdio">STDIO (本地命令)</option>
-                            <option value="http">HTTP (远程服务)</option>
-                        </select>
-                    </div>
-                    
-                    <!-- STDIO配置 -->
-                    <div id="mcp-stdio-config" style="display: none;">
-                        <div class="form-row">
-                            <label>命令</label>
-                            <input type="text" id="mcp-command" placeholder="如: npx">
-                        </div>
-                        <div class="form-row">
-                            <label>参数列表</label>
-                            <div id="mcp-args-container">
-                                <div class="args-input-group">
-                                    <input type="text" class="arg-input" placeholder="输入参数，如 -y">
-                                    <button type="button" class="add-arg-btn">+</button>
-                                </div>
-                            </div>
-                            <small style="color: #666; font-size: 12px;">点击 + 添加更多参数</small>
+                    <div class="form-row compact">
+                        <label>类型 <span class="required">*</span></label>
+                        <div class="radio-group">
+                            <label><input type="radio" name="mcp-type" value="stdio" checked> 本地 (stdio)</label>
+                            <label><input type="radio" name="mcp-type" value="http"> 远程 (http/sse)</label>
                         </div>
                     </div>
-                    
-                    <!-- HTTP配置 -->
-                    <div id="mcp-http-config" style="display: none;">
-                        <div class="form-row">
-                            <label>服务URL</label>
-                            <input type="url" id="mcp-url" placeholder="https://example.com/mcp">
+                    <div class="form-row compact" id="mcp-command-row">
+                        <label>命令 <span class="required">*</span></label>
+                        <input type="text" id="mcp-command" placeholder="如 C:/Users/xxx/uvx.exe">
+                    </div>
+                    <div class="form-row compact" id="mcp-args-row">
+                        <label>参数</label>
+                        <input type="text" id="mcp-args" placeholder="如 mcp-server-office">
+                    </div>
+                    <div class="form-row compact" id="mcp-url-row" style="display: none;">
+                        <label>URL <span class="required">*</span></label>
+                        <input type="text" id="mcp-url" placeholder="如 http://localhost:8080/sse">
+                    </div>
+                    <div class="form-row compact">
+                        <label>环境变量</label>
+                        <textarea id="mcp-env" rows="2" placeholder="KEY=VALUE 每行一个"></textarea>
+                    </div>
+                    <div class="form-actions-bottom compact">
+                        <div class="form-actions-left">
+                            <button type="button" id="mcp-delete-btn" class="btn-danger">删除</button>
+                            <span id="mcp-status" class="mcp-test-status"></span>
                         </div>
-                    </div>
-                    
-                    <!-- 环境变量配置 -->
-                    <div class="form-row">
-                        <label>环境变量 (可选)</label>
-                        <div id="mcp-env-container">
-                            <div class="env-input-group">
-                                <input type="text" class="env-key-input" placeholder="变量名">
-                                <input type="text" class="env-value-input" placeholder="变量值">
-                                <button type="button" class="add-env-btn">+</button>
-                            </div>
+                        <div class="form-actions-right">
+                            <button type="button" id="mcp-test-btn" class="btn-secondary">测试</button>
+                            <button type="submit" class="btn-primary">保存</button>
                         </div>
-                        <small style="color: #666; font-size: 12px;">点击 + 添加更多环境变量</small>
-                    </div>
-                    
-                    <div class="form-row">
-                        <label style="flex-direction: row; display: flex; align-items: center; gap: 8px;">
-                            <input type="checkbox" id="mcp-is-enabled" checked style="width: auto;"> 启用此服务器
-                        </label>
-                    </div>
-                    <div class="form-actions">
-                        <button type="submit">保存</button>
-                        <button type="button" id="mcp-form-reset">重置</button>
-                        <button type="button" id="mcp-test-connection">测试连接</button>
                     </div>
                 </form>
             </div>
@@ -563,9 +511,15 @@
                             </small>
                         </div>
                         
-                        <div style="background: #e8f5e9; padding: 10px; border-radius: 4px; margin-top: 10px;">
+                        <div style="background: #fff3e0; padding: 10px; border-radius: 4px; margin-top: 10px;">
+                            <small style="color: #e65100;">
+                                ⚠️ DuckDuckGo 需要能够访问国际互联网，如无法访问请使用 Tavily
+                            </small>
+                        </div>
+                        
+                        <div style="background: #e8f5e9; padding: 10px; border-radius: 4px; margin-top: 8px;">
                             <small style="color: #2e7d32;">
-                                💡 DuckDuckGo 搜索完全免费，无需配置 API Key，开箱即用！
+                                💡 Tavily 提供免费额度，搜索结果质量更高，推荐使用
                             </small>
                         </div>
                     </div>
@@ -583,10 +537,10 @@
 </div>
 
 <!-- 引入Markdown处理模块 -->
-<script src="markdown.js?v=128"></script>
+<script src="markdown.js?v=131"></script>
 
 <!-- 引入外部JavaScript -->
-<script src="script.js?v=149"></script>
+<script src="script.js?v=206"></script>
 
 </body>
 </html>

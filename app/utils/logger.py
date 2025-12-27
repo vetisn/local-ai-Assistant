@@ -20,31 +20,39 @@ LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # 创建不同类型的日志记录器
-def setup_logger(name: str, log_file: str, level=logging.INFO):
-    """设置日志记录器"""
+def setup_logger(name: str, log_file: str, level=logging.INFO, console_output=False):
+    """设置日志记录器
+    
+    Args:
+        name: 日志记录器名称
+        log_file: 日志文件名
+        level: 日志级别
+        console_output: 是否输出到控制台（默认关闭，减少终端噪音）
+    """
     formatter = logging.Formatter(LOG_FORMAT, DATE_FORMAT)
     
     # 文件处理器
     file_handler = logging.FileHandler(os.path.join(LOGS_DIR, log_file), encoding='utf-8')
     file_handler.setFormatter(formatter)
     
-    # 控制台处理器
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    
     logger = logging.getLogger(name)
     logger.setLevel(level)
     logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
+    
+    # 仅在需要时添加控制台处理器
+    if console_output:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
     
     return logger
 
-# 创建各种日志记录器
+# 创建各种日志记录器（默认不输出到控制台）
 main_logger = setup_logger('main', 'main.log')
 api_logger = setup_logger('api', 'api.log')
 chat_logger = setup_logger('chat', 'chat.log')
 token_logger = setup_logger('token', 'token.log')
-error_logger = setup_logger('error', 'error.log', logging.ERROR)
+error_logger = setup_logger('error', 'error.log', logging.ERROR, console_output=True)  # 错误仍输出到控制台
 db_logger = setup_logger('database', 'database.log')
 
 class DetailedLogger:

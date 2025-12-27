@@ -79,6 +79,15 @@ class Message(Base):
     input_tokens = Column(Integer, nullable=True)  # 输入token数
     output_tokens = Column(Integer, nullable=True)  # 输出token数
     total_tokens = Column(Integer, nullable=True)  # 总token数
+    
+    # 新增：工具调用和深度思考内容（用于历史消息显示）
+    tool_calls = Column(Text, nullable=True)  # JSON格式的工具调用信息（已废弃，保留兼容）
+    thinking_content = Column(Text, nullable=True)  # 深度思考内容（已废弃，保留兼容）
+    vision_content = Column(Text, nullable=True)  # 视觉/OCR识别内容（已废弃，保留兼容）
+    
+    # 新增：统一的消息事件流（按时间顺序记录所有事件）
+    # 事件类型: vision, thinking, text, tool_call
+    message_events = Column(Text, nullable=True)  # JSON格式的事件列表
 
     conversation = relationship("Conversation", back_populates="messages")
 
@@ -93,6 +102,10 @@ class Message(Base):
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
+            "tool_calls": self.tool_calls,
+            "thinking_content": self.thinking_content,
+            "vision_content": self.vision_content,
+            "message_events": self.message_events,
         }
 
 

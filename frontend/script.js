@@ -29,6 +29,48 @@ function normalizeApiResponse(json) {
     return json;
 }
 
+// 去除Markdown符号，转为纯文本
+function stripMarkdown(text) {
+    if (!text) return '';
+    
+    return text
+        // 移除代码块
+        .replace(/```[\s\S]*?```/g, (match) => {
+            // 提取代码块内容（去掉语言标识）
+            const lines = match.split('\n');
+            lines.shift(); // 移除开头的 ```language
+            lines.pop();   // 移除结尾的 ```
+            return lines.join('\n');
+        })
+        // 移除行内代码的反引号
+        .replace(/`([^`]+)`/g, '$1')
+        // 移除粗体
+        .replace(/\*\*([^*]+)\*\*/g, '$1')
+        .replace(/__([^_]+)__/g, '$1')
+        // 移除斜体
+        .replace(/\*([^*]+)\*/g, '$1')
+        .replace(/_([^_]+)_/g, '$1')
+        // 移除删除线
+        .replace(/~~([^~]+)~~/g, '$1')
+        // 移除标题符号
+        .replace(/^#{1,6}\s+/gm, '')
+        // 移除引用符号
+        .replace(/^>\s+/gm, '')
+        // 移除无序列表符号
+        .replace(/^[\*\-\+]\s+/gm, '')
+        // 移除有序列表符号
+        .replace(/^\d+\.\s+/gm, '')
+        // 移除链接，保留文本
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+        // 移除图片
+        .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+        // 移除水平线
+        .replace(/^[-*_]{3,}\s*$/gm, '')
+        // 移除多余空行
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
 // 流式传输控制变量
 let isStreaming = false;
 let currentStreamController = null;
@@ -36,19 +78,30 @@ let currentStreamingMessageEl = null; // 跟踪当前正在流式输出的消息
 
 const autoTitleRequested = new Set();
 
+// 深度思考开关状态
+let enableThinking = true; // 默认开启
 
+// 对话文件上传相关
+let uploadedFiles = []; // 当前对话已上传的文件列表
+let fileUploadInputEl, uploadedFilesPreviewEl, uploadedFilesListEl, dropOverlayEl, mainPanelEl;
 
 // DOM元素变量 - 统一声明
 let conversationListEl, chatMessagesEl, chatTitleEl, modelSelectEl, providerSelectEl;
-let userInputEl, toggleKnowledgeEl, toggleMcpEl, toggleWebEl, toggleStreamEl;
+let userInputEl, toggleKnowledgeEl, toggleMcpEl, toggleWebEl, toggleThinkingEl;
 let providerModalEl, providerListEl, providerFormEl;
 let knowledgeModalEl, kbListEl, kbFormEl, kbSelectEl, kbUploadFormEl, kbUploadStatusEl, embeddingModelSelectEl;
 let mcpModalEl, mcpListEl, mcpFormEl, settingsModalEl;
 
-// 滚动到底部
+// 滚动到底部（带节流）
+let _scrollThrottleTimer = null;
 function scrollToBottom() {
-    if (chatMessagesEl) {
-        chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+    if (!_scrollThrottleTimer) {
+        _scrollThrottleTimer = setTimeout(() => {
+            _scrollThrottleTimer = null;
+            if (chatMessagesEl) {
+                chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+            }
+        }, 50);
     }
 }
 
@@ -242,8 +295,9 @@ function initSettingsCustomSelects() {
     // 设置页面的下拉框ID列表
     const settingsSelectIds = [
         'layout-scale-select',
+        'default-chat-model-select',
         'auto-title-model-select',
-        'ocr-method-select',
+        'default-vision-model-select',
         'export-logs-hours',
         'search-default-source',
         'mcp-connection-type'
@@ -292,7 +346,6 @@ function initDOMElements() {
     toggleKnowledgeEl = document.getElementById("toggle-knowledge");
     toggleMcpEl = document.getElementById("toggle-mcp");
     toggleWebEl = document.getElementById("toggle-web");
-    toggleStreamEl = document.getElementById("toggle-stream");
     providerModalEl = document.getElementById("provider-modal");
     providerListEl = document.getElementById("provider-list");
     providerFormEl = document.getElementById("provider-form");
@@ -307,6 +360,13 @@ function initDOMElements() {
     mcpListEl = document.getElementById("mcp-list");
     mcpFormEl = document.getElementById("mcp-form");
     settingsModalEl = document.getElementById("settings-modal");
+    
+    // 文件上传相关
+    fileUploadInputEl = document.getElementById("file-upload-input");
+    uploadedFilesPreviewEl = document.getElementById("uploaded-files-preview");
+    uploadedFilesListEl = document.getElementById("uploaded-files-list");
+    dropOverlayEl = document.getElementById("drop-overlay");
+    mainPanelEl = document.getElementById("main-panel");
 }
 // 输入框自适应高度设置
 function setupInputAutoResize() {
@@ -332,15 +392,20 @@ function loadToolSettings() {
         if (saved) {
             const settings = JSON.parse(saved);
             if (toggleKnowledgeEl) toggleKnowledgeEl.checked = settings.knowledge || false;
-            // MCP 状态由选中的服务决定，不直接从 settings.mcp 恢复
             if (toggleWebEl) toggleWebEl.checked = settings.web || false;
-            if (toggleStreamEl) toggleStreamEl.checked = settings.stream !== undefined ? settings.stream : true;
             
-            // 恢复 MCP 服务器选中状态
+            // MCP 服务器的选中状态已经在 loadMCPServers 中恢复
+            // 这里只需要启动选中的服务器
             if (settings.selectedMcpServers && Array.isArray(settings.selectedMcpServers)) {
-                mcpServers.forEach(server => {
-                    server.selected = settings.selectedMcpServers.includes(server.id);
+                // 启动选中的服务器（异步）
+                settings.selectedMcpServers.forEach(serverName => {
+                    // 检查服务器是否已经运行
+                    const server = mcpServers.find(s => s.id === serverName);
+                    if (server && !server.running) {
+                        startMcpServerIfNeeded(serverName);
+                    }
                 });
+                
                 // 更新 MCP 按钮状态
                 updateMcpToggleState();
             }
@@ -362,19 +427,53 @@ function loadToolSettings() {
     }
 }
 
+// 按需启动 MCP 服务器
+async function startMcpServerIfNeeded(serverName) {
+    try {
+        const res = await fetch(`${apiBase}/mcp/servers/${encodeURIComponent(serverName)}/start`, {
+            method: 'POST'
+        });
+        const data = await res.json();
+        if (data.success) {
+            // 保存当前选中状态到 localStorage（在刷新列表之前）
+            saveToolSettings();
+            // 刷新服务器列表以更新状态
+            await loadMCPServers();
+        } else {
+            console.warn(`[MCP] 服务器 ${serverName} 启动失败:`, data.error);
+        }
+    } catch (e) {
+        console.error(`[MCP] 启动服务器 ${serverName} 失败:`, e);
+    }
+}
+
+// 停止 MCP 服务器
+async function stopMcpServer(serverName) {
+    try {
+        const res = await fetch(`${apiBase}/mcp/servers/${encodeURIComponent(serverName)}/stop`, {
+            method: 'POST'
+        });
+        const data = await res.json();
+        if (data.success) {
+            // 服务器已停止
+        }
+    } catch (e) {
+        console.error(`[MCP] 停止服务器 ${serverName} 失败:`, e);
+    }
+}
+
 // 保存工具设置
 function saveToolSettings() {
     try {
-        // 收集选中的 MCP 服务器 ID
+        // 收集选中的 MCP 服务器名称（不管是否运行中）
         const selectedMcpServers = mcpServers
-            .filter(s => s.is_enabled && s.selected)
+            .filter(s => s.selected)
             .map(s => s.id);
         
         const settings = {
             knowledge: toggleKnowledgeEl ? toggleKnowledgeEl.checked : false,
             mcp: toggleMcpEl ? toggleMcpEl.checked : false,
             web: toggleWebEl ? toggleWebEl.checked : false,
-            stream: toggleStreamEl ? toggleStreamEl.checked : true,
             webSearchSource: selectedWebSource,
             selectedMcpServers: selectedMcpServers
         };
@@ -390,7 +489,6 @@ function setupToolSettingsListeners() {
     if (toggleKnowledgeEl) toggleKnowledgeEl.addEventListener('change', saveToolSettings);
     if (toggleMcpEl) toggleMcpEl.addEventListener('change', saveToolSettings);
     if (toggleWebEl) toggleWebEl.addEventListener('change', saveToolSettings);
-    if (toggleStreamEl) toggleStreamEl.addEventListener('change', saveToolSettings);
 }
 // Modal 控制函数
 function openModal(id) {
@@ -415,7 +513,21 @@ async function loadSettings() {
         if (layoutScaleSelect) layoutScaleSelect.value = settings.layout_scale || "normal";
         
         const searchDefaultSource = document.getElementById("search-default-source");
-        if (searchDefaultSource) searchDefaultSource.value = settings.default_search_source || "duckduckgo";
+        if (searchDefaultSource) {
+            searchDefaultSource.value = settings.default_search_source || "duckduckgo";
+            refreshCustomSelect(searchDefaultSource);
+        }
+        
+        // 显示 Tavily API Key 配置状态
+        const tavilyApiKeyInput = document.getElementById("search-tavily-api-key");
+        if (tavilyApiKeyInput) {
+            if (settings.tavily_api_key) {
+                tavilyApiKeyInput.placeholder = settings.tavily_api_key + " (已配置，留空保持不变)";
+            } else {
+                tavilyApiKeyInput.placeholder = "输入 Tavily API Key";
+            }
+            tavilyApiKeyInput.value = "";  // 不显示实际值
+        }
         
         // 获取所有可用模型
         await loadModels(); // 确保先加载模型
@@ -426,7 +538,7 @@ async function loadSettings() {
             availableModels = modelsData.models || [];
         }
         
-        // 更新自动命名模型选择器（按Provider分组）
+        // 更新自动命名模型选择器（按Provider分组，只显示有对话功能的模型）
         const autoTitleSelect = document.getElementById("auto-title-model-select");
         if (autoTitleSelect) {
             autoTitleSelect.innerHTML = "";
@@ -437,17 +549,31 @@ async function loadSettings() {
             currentOpt.textContent = "使用当前对话模型";
             autoTitleSelect.appendChild(currentOpt);
             
-            // 按Provider分组添加模型
+            // 按Provider分组添加模型（只显示有对话功能的）
             const modelsData = await fetch(`${apiBase}/models/all`).then(r => r.json());
             const providers = modelsData.providers || [];
             const modelsNamesMap = modelsData.models_names || {};
+            const modelsCapsMap = modelsData.models_caps || {};
             
             providers.forEach(provider => {
-                if (provider.models && provider.models.length > 0) {
+                // 获取该Provider的所有模型（包括默认模型）
+                let providerModels = provider.models || [];
+                if (provider.default_model && !providerModels.includes(provider.default_model)) {
+                    providerModels = [provider.default_model, ...providerModels];
+                }
+                
+                // 过滤只有对话功能的模型
+                const chatModels = providerModels.filter(model => {
+                    const caps = modelsCapsMap[model];
+                    // 如果没有配置功能信息，默认认为有对话功能
+                    return !caps || caps.chat;
+                });
+                
+                if (chatModels.length > 0) {
                     const optgroup = document.createElement("optgroup");
                     optgroup.label = provider.name;
                     
-                    provider.models.forEach(model => {
+                    chatModels.forEach(model => {
                         const opt = document.createElement("option");
                         opt.value = model;
                         // 优先使用自定义名称
@@ -464,12 +590,63 @@ async function loadSettings() {
             refreshCustomSelect(autoTitleSelect);
         }
         
-        // 加载视觉模型后设置OCR方法
+        // 加载视觉模型
         await loadVisionModels();
-        const ocrMethodSelect = document.getElementById("ocr-method-select");
-        if (ocrMethodSelect && settings.ocr_method) {
-            ocrMethodSelect.value = settings.ocr_method;
-            refreshCustomSelect(ocrMethodSelect);
+        
+        // 更新默认对话模型选择器（按Provider分组，只显示有对话或生图功能的模型）
+        const defaultChatModelSelect = document.getElementById("default-chat-model-select");
+        if (defaultChatModelSelect) {
+            defaultChatModelSelect.innerHTML = "";
+            
+            // 添加特殊选项
+            const rememberOpt = document.createElement("option");
+            rememberOpt.value = "remember_last";
+            rememberOpt.textContent = "记忆上次选择";
+            defaultChatModelSelect.appendChild(rememberOpt);
+            
+            const defaultOpt = document.createElement("option");
+            defaultOpt.value = "";
+            defaultOpt.textContent = "使用 Provider 默认模型";
+            defaultChatModelSelect.appendChild(defaultOpt);
+            
+            // 按Provider分组添加模型（只显示有对话或生图功能的）
+            const chatModelData = await fetch(`${apiBase}/models/all`).then(r => r.json());
+            const chatProviders = chatModelData.providers || [];
+            const chatModelsNamesMap = chatModelData.models_names || {};
+            const chatModelsCapsMap = chatModelData.models_caps || {};
+            
+            chatProviders.forEach(provider => {
+                let providerModels = provider.models || [];
+                if (provider.default_model && !providerModels.includes(provider.default_model)) {
+                    providerModels = [provider.default_model, ...providerModels];
+                }
+                
+                // 过滤：只显示有对话或生图功能的模型
+                const filteredModels = providerModels.filter(model => {
+                    const caps = chatModelsCapsMap[model];
+                    // 如果没有配置功能信息，默认认为有对话功能
+                    return !caps || caps.chat || caps.image_gen;
+                });
+                
+                if (filteredModels.length > 0) {
+                    const optgroup = document.createElement("optgroup");
+                    optgroup.label = provider.name;
+                    
+                    filteredModels.forEach(model => {
+                        const opt = document.createElement("option");
+                        opt.value = model;
+                        const displayName = chatModelsNamesMap[model] || model;
+                        opt.textContent = displayName;
+                        optgroup.appendChild(opt);
+                    });
+                    
+                    defaultChatModelSelect.appendChild(optgroup);
+                }
+            });
+            
+            // 设置当前值，默认为 remember_last
+            defaultChatModelSelect.value = settings.default_chat_model || "remember_last";
+            refreshCustomSelect(defaultChatModelSelect);
         }
         
         // 应用设置
@@ -515,6 +692,9 @@ async function loadModels() {
         modelsNames = data.models_names || {};
         modelsProviders = data.providers || [];
         
+        // 保存当前选择的模型（如果有）
+        const currentSelectedModel = modelSelectEl.value;
+        
         // 更新隐藏的原生 select（用于表单提交等）
         modelSelectEl.innerHTML = "";
         const models = data.models || [];
@@ -525,7 +705,13 @@ async function loadModels() {
             opt.textContent = displayName + (m === data.default ? " (默认)" : "");
             modelSelectEl.appendChild(opt);
         });
-        if(data.default) modelSelectEl.value = data.default;
+        
+        // 恢复之前选择的模型，如果不存在则使用默认值
+        if (currentSelectedModel && models.includes(currentSelectedModel)) {
+            modelSelectEl.value = currentSelectedModel;
+        } else if (data.default) {
+            modelSelectEl.value = data.default;
+        }
         
         // 更新自定义下拉组件（按Provider分组）
         updateCustomModelSelect(models, data.default);
@@ -539,7 +725,7 @@ async function loadModels() {
     } catch(e) { console.error(e); }
 }
 
-// 更新自定义模型下拉组件（按Provider分组）
+// 更新自定义模型下拉组件（按Provider分组，只显示有对话功能的模型）
 function updateCustomModelSelect(models, defaultModel) {
     const dropdown = document.getElementById("model-select-dropdown");
     const trigger = document.getElementById("model-select-trigger");
@@ -554,10 +740,27 @@ function updateCustomModelSelect(models, defaultModel) {
         return;
     }
     
+    // 过滤有对话功能的模型
+    const filterChatModels = (modelList) => {
+        return modelList.filter(m => {
+            const caps = modelsCaps[m];
+            // 如果没有配置功能信息，默认认为有对话功能
+            return !caps || caps.chat;
+        });
+    };
+    
     // 按Provider分组显示
     if (modelsProviders && modelsProviders.length > 0) {
         modelsProviders.forEach(provider => {
-            if (!provider.models || provider.models.length === 0) return;
+            // 获取该Provider的所有模型（包括默认模型）
+            let providerModels = provider.models || [];
+            if (provider.default_model && !providerModels.includes(provider.default_model)) {
+                providerModels = [provider.default_model, ...providerModels];
+            }
+            
+            // 过滤只有对话功能的模型
+            const chatModels = filterChatModels(providerModels);
+            if (chatModels.length === 0) return;
             
             // 创建分组标题
             const groupHeader = document.createElement("div");
@@ -566,7 +769,7 @@ function updateCustomModelSelect(models, defaultModel) {
             dropdown.appendChild(groupHeader);
             
             // 添加该Provider下的模型
-            provider.models.forEach(m => {
+            chatModels.forEach(m => {
                 const displayName = modelsNames[m] || m;
                 const caps = modelsCaps[m] || {};
                 
@@ -598,8 +801,9 @@ function updateCustomModelSelect(models, defaultModel) {
             });
         });
     } else {
-        // 没有Provider信息时，直接显示所有模型
-        models.forEach(m => {
+        // 没有Provider信息时，直接显示所有有对话功能的模型
+        const chatModels = filterChatModels(models);
+        chatModels.forEach(m => {
             const displayName = modelsNames[m] || m;
             const caps = modelsCaps[m] || {};
             
@@ -669,6 +873,12 @@ function selectModelOption(value, displayText) {
     
     // 更新功能标识
     updateModelCapsBadge();
+    
+    // 保存用户选择的模型到 localStorage（用于记忆功能）
+    if (value) {
+        localStorage.setItem("last_selected_model", value);
+        localStorage.setItem("last_selected_model_display", displayText);
+    }
 }
 
 // 初始化自定义下拉组件事件
@@ -697,6 +907,14 @@ function updateModelCapsBadge() {
     const badge = document.getElementById("model-caps-badge");
     if (!badge || !modelSelectEl) return;
     const selectedModel = modelSelectEl.value;
+    
+    // 如果没有选择模型，清空标识
+    if (!selectedModel) {
+        badge.innerHTML = "";
+        return;
+    }
+    
+    // 调试：检查 modelsCaps 是否包含当前模型
     const caps = modelsCaps[selectedModel] || {};
     
     let html = "";
@@ -713,7 +931,56 @@ function updateModelCapsBadge() {
         html += '<span class="cap-icon active" title="生图">🎨</span>';
     }
     
+    // 如果没有任何功能标识，显示默认的对话图标
+    if (!html && selectedModel) {
+        html = '<span class="cap-icon" title="对话">💬</span>';
+    }
+    
     badge.innerHTML = html;
+    
+    // 更新深度思考开关的显示状态
+    updateThinkingToggleVisibility(caps.reasoning);
+    
+    // 更新生图按钮的显示状态（只有生图模型才显示）
+    updateImageGenToggleVisibility(caps.image_gen);
+}
+
+// 更新生图按钮的显示状态
+function updateImageGenToggleVisibility(hasImageGen) {
+    const imageGenWrapper = document.getElementById("image-gen-toggle-wrapper");
+    const imageGenCheckbox = document.getElementById("toggle-image-gen");
+    if (imageGenWrapper) {
+        imageGenWrapper.style.display = hasImageGen ? "flex" : "none";
+        // 如果模型不支持生图，取消勾选
+        if (!hasImageGen && imageGenCheckbox) {
+            imageGenCheckbox.checked = false;
+        }
+    }
+}
+
+// 更新深度思考开关的显示状态
+function updateThinkingToggleVisibility(hasReasoning) {
+    const thinkingWrapper = document.getElementById("thinking-toggle-wrapper");
+    if (thinkingWrapper) {
+        thinkingWrapper.style.display = hasReasoning ? "flex" : "none";
+    }
+}
+
+// 初始化深度思考开关
+function initThinkingToggle() {
+    toggleThinkingEl = document.getElementById("toggle-thinking");
+    if (!toggleThinkingEl) return;
+    
+    // 从 localStorage 恢复状态
+    const saved = localStorage.getItem("enableThinking");
+    enableThinking = saved !== null ? saved === "true" : true; // 默认开启
+    toggleThinkingEl.checked = enableThinking;
+    
+    // 监听变化
+    toggleThinkingEl.addEventListener("change", () => {
+        enableThinking = toggleThinkingEl.checked;
+        localStorage.setItem("enableThinking", enableThinking);
+    });
 }
 
 async function loadConversations() {
@@ -779,27 +1046,303 @@ async function loadMCPServers() {
     try {
         const res = await fetch(`${apiBase}/mcp/servers`);
         if (!res.ok) return;
-        const raw = await res.json();
-        mcpServers = normalizeApiResponse(raw) || [];
-        // 加载后更新 MCP 按钮状态
+        const data = await res.json();
+        const servers = data.servers || [];
+        
+        // 从 localStorage 获取之前选中的服务器
+        let savedSelectedServers = [];
+        try {
+            const saved = localStorage.getItem(TOOL_SETTINGS_KEY);
+            if (saved) {
+                const settings = JSON.parse(saved);
+                savedSelectedServers = settings.selectedMcpServers || [];
+            }
+        } catch (e) {}
+        
+        // 更新全局变量（用于主页面 MCP 弹出框）
+        mcpServers = servers.map(s => ({
+            ...s,
+            id: s.name,  // 用 name 作为 id
+            // 恢复之前的选中状态
+            selected: savedSelectedServers.includes(s.name)
+        }));
+        
+        // 更新服务器列表（MCP 管理弹窗）
+        const listEl = document.getElementById("mcp-list");
+        if (listEl) {
+            if (servers.length === 0) {
+                listEl.innerHTML = '<div class="empty-hint">暂无 MCP Server</div>';
+            } else {
+                listEl.innerHTML = servers.map(s => `
+                    <div class="mcp-item ${s.running ? 'active' : ''}" data-name="${s.name}" onclick="selectMCPServer('${s.name}')">
+                        <div class="mcp-item-info">
+                            <span class="mcp-name">${s.name}</span>
+                            <span class="mcp-type">${s.type || 'stdio'}</span>
+                        </div>
+                        <span class="mcp-status-dot ${s.running ? 'online' : 'offline'}"></span>
+                    </div>
+                `).join('');
+            }
+        }
+        
+        // 保存服务器数据供编辑使用
+        window._mcpServers = servers;
+        
+        // 更新主页面 MCP 弹出框选项（如果弹出框打开的话）
+        updateMcpPopupOptions();
+        
+        // 更新 MCP 按钮状态（根据选中状态）
         updateMcpToggleState();
-    } catch(e) { console.error(e); }
+    } catch(e) { 
+        console.error("加载MCP服务器失败:", e); 
+    }
+}
+
+// 选择 MCP 服务器进行编辑
+function selectMCPServer(name) {
+    const servers = window._mcpServers || [];
+    const server = servers.find(s => s.name === name);
+    if (!server) return;
+    
+    // 高亮选中项
+    document.querySelectorAll("#mcp-list .mcp-item").forEach(el => {
+        el.classList.toggle("selected", el.dataset.name === name);
+    });
+    
+    // 填充表单
+    document.getElementById("mcp-form-title").textContent = "编辑 MCP Server";
+    document.getElementById("mcp-edit-name").value = name;
+    document.getElementById("mcp-name").value = server.name;
+    document.getElementById("mcp-command").value = server.command || "";
+    document.getElementById("mcp-args").value = (server.args || []).join(" ");
+    document.getElementById("mcp-url").value = server.url || "";
+    document.getElementById("mcp-env").value = server.env ? Object.entries(server.env).map(([k,v]) => `${k}=${v}`).join("\n") : "";
+    
+    // 设置类型
+    const typeRadios = document.querySelectorAll('input[name="mcp-type"]');
+    typeRadios.forEach(r => r.checked = r.value === (server.type || "stdio"));
+    updateMCPTypeFields();
+    
+    // 显示删除按钮，清除状态
+    document.getElementById("mcp-delete-btn").style.display = "block";
+    const statusEl = document.getElementById("mcp-status");
+    if (statusEl) {
+        // 显示运行状态
+        if (server.running) {
+            statusEl.textContent = "✓ 运行中";
+            statusEl.className = "mcp-test-status success";
+        } else {
+            statusEl.textContent = "";
+            statusEl.className = "mcp-test-status";
+        }
+    }
+}
+
+// 重置 MCP 表单
+function resetMCPForm() {
+    document.getElementById("mcp-form-title").textContent = "新建 MCP Server";
+    document.getElementById("mcp-edit-name").value = "";
+    document.getElementById("mcp-name").value = "";
+    document.getElementById("mcp-command").value = "";
+    document.getElementById("mcp-args").value = "";
+    document.getElementById("mcp-url").value = "";
+    document.getElementById("mcp-env").value = "";
+    document.querySelector('input[name="mcp-type"][value="stdio"]').checked = true;
+    updateMCPTypeFields();
+    document.getElementById("mcp-delete-btn").style.display = "none";
+    
+    const statusEl = document.getElementById("mcp-status");
+    if (statusEl) {
+        statusEl.textContent = "";
+        statusEl.className = "mcp-test-status";
+    }
+    
+    // 取消选中
+    document.querySelectorAll("#mcp-list .mcp-item").forEach(el => el.classList.remove("selected"));
+}
+
+// 根据类型切换显示字段
+function updateMCPTypeFields() {
+    const type = document.querySelector('input[name="mcp-type"]:checked')?.value || "stdio";
+    document.getElementById("mcp-command-row").style.display = type === "stdio" ? "" : "none";
+    document.getElementById("mcp-args-row").style.display = type === "stdio" ? "" : "none";
+    document.getElementById("mcp-url-row").style.display = type === "http" ? "" : "none";
+}
+
+// MCP 表单初始化
+function initMCPForm() {
+    const form = document.getElementById("mcp-form");
+    if (!form) return;
+    
+    // 类型切换
+    document.querySelectorAll('input[name="mcp-type"]').forEach(r => {
+        r.addEventListener("change", updateMCPTypeFields);
+    });
+    
+    // 新建按钮
+    const addBtn = document.getElementById("mcp-add-btn");
+    if (addBtn) {
+        addBtn.addEventListener("click", resetMCPForm);
+    }
+    
+    // 删除按钮
+    const deleteBtn = document.getElementById("mcp-delete-btn");
+    if (deleteBtn) {
+        deleteBtn.addEventListener("click", async () => {
+            const editName = document.getElementById("mcp-edit-name").value;
+            if (!editName) return;
+            if (!confirm(`确定要删除 MCP Server "${editName}" 吗？`)) return;
+            
+            const statusEl = document.getElementById("mcp-status");
+            statusEl.textContent = "正在删除...";
+            
+            try {
+                const res = await fetch(`${apiBase}/mcp/servers/${editName}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (data.success) {
+                    statusEl.textContent = "✓ 已删除";
+                    resetMCPForm();
+                    await loadMCPServers();
+                } else {
+                    statusEl.textContent = "✗ " + (data.error || "删除失败");
+                }
+            } catch(e) {
+                statusEl.textContent = "✗ 删除失败: " + e.message;
+            }
+        });
+    }
+    
+    // 测试按钮 - 只测试连接，不保存
+    const testBtn = document.getElementById("mcp-test-btn");
+    if (testBtn) {
+        testBtn.addEventListener("click", async () => {
+            const name = document.getElementById("mcp-name").value.trim();
+            const type = document.querySelector('input[name="mcp-type"]:checked')?.value || "stdio";
+            const command = document.getElementById("mcp-command").value.trim();
+            const args = document.getElementById("mcp-args").value.trim();
+            const url = document.getElementById("mcp-url").value.trim();
+            const envText = document.getElementById("mcp-env").value.trim();
+            
+            if (!name) {
+                alert("请先填写名称");
+                return;
+            }
+            
+            if (type === "stdio" && !command) {
+                alert("请填写命令");
+                return;
+            }
+            
+            const statusEl = document.getElementById("mcp-status");
+            statusEl.textContent = "正在测试...";
+            statusEl.className = "mcp-test-status";
+            
+            try {
+                // 只测试，不保存到数据库
+                const formData = new FormData();
+                formData.append("name", name);
+                formData.append("type", type);
+                formData.append("command", command);
+                formData.append("args", args);
+                formData.append("url", url);
+                formData.append("env", envText);
+                
+                const res = await fetch(`${apiBase}/mcp/servers/test`, {
+                    method: 'POST',
+                    body: formData
+                });
+                const data = await res.json();
+                
+                if (data.success) {
+                    const toolCount = data.tools ? data.tools.length : 0;
+                    statusEl.textContent = `✓ 连接成功，${toolCount}个工具`;
+                    statusEl.className = "mcp-test-status success";
+                } else {
+                    statusEl.textContent = "✗ 连接失败";
+                    statusEl.className = "mcp-test-status error";
+                }
+            } catch(e) {
+                statusEl.textContent = "✗ 测试失败";
+                statusEl.className = "mcp-test-status error";
+            }
+        });
+    }
+    
+    // 表单提交
+    form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        
+        const editName = document.getElementById("mcp-edit-name").value;
+        const name = document.getElementById("mcp-name").value.trim();
+        const type = document.querySelector('input[name="mcp-type"]:checked')?.value || "stdio";
+        const command = document.getElementById("mcp-command").value.trim();
+        const args = document.getElementById("mcp-args").value.trim();
+        const url = document.getElementById("mcp-url").value.trim();
+        const envText = document.getElementById("mcp-env").value.trim();
+        
+        if (!name) {
+            alert("请填写名称");
+            return;
+        }
+        
+        if (type === "stdio" && !command) {
+            alert("请填写命令");
+            return;
+        }
+        
+        if (type === "http" && !url) {
+            alert("请填写 URL");
+            return;
+        }
+        
+        const statusEl = document.getElementById("mcp-status");
+        statusEl.textContent = "正在保存...";
+        
+        try {
+            // 如果是编辑且名称变了，先删除旧的
+            if (editName && editName !== name) {
+                await fetch(`${apiBase}/mcp/servers/${editName}`, { method: 'DELETE' });
+            }
+            
+            const formData = new FormData();
+            formData.append("name", name);
+            formData.append("type", type);
+            formData.append("command", command);
+            formData.append("args", args);
+            formData.append("url", url);
+            formData.append("env", envText);
+            formData.append("enabled", "true");
+            
+            const res = await fetch(`${apiBase}/mcp/servers`, {
+                method: 'POST',
+                body: formData
+            });
+            const data = await res.json();
+            
+            if (data.success) {
+                statusEl.textContent = "✓ 保存成功";
+                statusEl.className = "mcp-test-status success";
+                document.getElementById("mcp-edit-name").value = name;
+                document.getElementById("mcp-delete-btn").style.display = "block";
+                await loadMCPServers();
+                // 选中刚保存的
+                setTimeout(() => selectMCPServer(name), 100);
+            } else {
+                statusEl.textContent = "✗ 保存失败";
+                statusEl.className = "mcp-test-status error";
+            }
+        } catch(e) {
+            statusEl.textContent = "✗ 保存失败: " + e.message;
+        }
+    });
+    
+    // 初始隐藏删除按钮
+    if (deleteBtn) deleteBtn.style.display = "none";
 }
 
 // 加载向量模型列表
 async function loadEmbeddingModels() {
     try {
-        // 先检测本地模型可用性
-        let localAvailability = { tesseract: false, local_rag: false };
-        try {
-            const localRes = await fetch(`${apiBase}/models/local-availability`);
-            if (localRes.ok) {
-                localAvailability = await localRes.json();
-            }
-        } catch (e) {
-            console.warn("检测本地模型可用性失败:", e);
-        }
-        
         const res = await fetch(`${apiBase}/knowledge/embedding-models`);
         if (!res.ok) return;
         const raw = await res.json();
@@ -818,35 +1361,15 @@ async function loadEmbeddingModels() {
         defaultOpt.textContent = "请选择向量模型";
         embeddingModelSelectEl.appendChild(defaultOpt);
         
-        // 如果本地 RAG 可用，添加本地选项
-        if (localAvailability.local_rag) {
-            const localOpt = document.createElement("option");
-            localOpt.value = "local-rag";
-            localOpt.textContent = "本地 RAG 模型 (mcp-local-rag)";
-            embeddingModelSelectEl.appendChild(localOpt);
-        }
-        
-        // 显示/隐藏本地 RAG 推荐
-        const localRagInfo = document.getElementById("local-rag-info");
-        
         if (!data.models || data.models.length === 0) {
-            if (!localAvailability.local_rag) {
-                // 没有任何可用模型
-                const opt = document.createElement("option");
-                opt.value = "";
-                opt.textContent = data.message || "无可用向量模型";
-                opt.disabled = true;
-                embeddingModelSelectEl.appendChild(opt);
-            }
-            
-            // 没有向量模型时显示本地 RAG 推荐
-            if (localRagInfo) localRagInfo.style.display = "block";
+            const opt = document.createElement("option");
+            opt.value = "";
+            opt.textContent = data.message || "无可用向量模型，请在Provider中配置";
+            opt.disabled = true;
+            embeddingModelSelectEl.appendChild(opt);
             refreshCustomSelect(embeddingModelSelectEl);
             return;
         }
-        
-        // 有向量模型时隐藏推荐
-        if (localRagInfo) localRagInfo.style.display = "none";
         
         // 按Provider分组添加模型
         const modelsByProvider = data.models_by_provider || [];
@@ -900,17 +1423,6 @@ async function loadEmbeddingModels() {
 // 加载视觉模型列表 - 从已配置的模型中筛选支持视觉的
 async function loadVisionModels() {
     try {
-        // 先检测本地模型可用性
-        let localAvailability = { tesseract: false, local_rag: false };
-        try {
-            const localRes = await fetch(`${apiBase}/models/local-availability`);
-            if (localRes.ok) {
-                localAvailability = await localRes.json();
-            }
-        } catch (e) {
-            console.warn("检测本地模型可用性失败:", e);
-        }
-        
         // 获取支持视觉的模型列表
         const visionModels = [];
         for (const [model, caps] of Object.entries(modelsCaps)) {
@@ -940,14 +1452,6 @@ async function loadVisionModels() {
             const currentValue = kbVisionModelSelect.value;
             kbVisionModelSelect.innerHTML = '<option value="">不启用</option>';
             
-            // 只有本地 Tesseract 可用时才显示
-            if (localAvailability.tesseract) {
-                const opt = document.createElement("option");
-                opt.value = "tesseract";
-                opt.textContent = "Tesseract OCR (本地)";
-                kbVisionModelSelect.appendChild(opt);
-            }
-            
             // 添加视觉模型选项
             if (visionModels.length > 0) {
                 const optgroup = document.createElement("optgroup");
@@ -969,39 +1473,60 @@ async function loadVisionModels() {
             refreshCustomSelect(kbVisionModelSelect);
         }
         
-        // 更新设置页面的OCR方法选择器
-        const ocrMethodSelect = document.getElementById("ocr-method-select");
-        if (ocrMethodSelect) {
-            const currentValue = ocrMethodSelect.value;
-            ocrMethodSelect.innerHTML = '<option value="">不启用</option>';
+        // 更新设置页面的默认视觉模型选择器
+        const defaultVisionModelSelect = document.getElementById("default-vision-model-select");
+        if (defaultVisionModelSelect) {
+            const currentValue = defaultVisionModelSelect.value;
+            defaultVisionModelSelect.innerHTML = '<option value="">不启用</option>';
             
-            // 只有本地 Tesseract 可用时才显示
-            if (localAvailability.tesseract) {
-                const opt = document.createElement("option");
-                opt.value = "tesseract";
-                opt.textContent = "Tesseract OCR (本地)";
-                ocrMethodSelect.appendChild(opt);
-            }
-            
-            // 添加视觉模型选项
-            if (visionModels.length > 0) {
-                const optgroup = document.createElement("optgroup");
-                optgroup.label = "视觉模型";
+            // 按 Provider 分组添加视觉模型，value 格式为 provider_id:model_name
+            if (modelsProviders.length > 0) {
+                modelsProviders.forEach(provider => {
+                    let providerModels = provider.models || [];
+                    if (provider.default_model && !providerModels.includes(provider.default_model)) {
+                        providerModels = [provider.default_model, ...providerModels];
+                    }
+                    
+                    // 过滤只有视觉功能的模型
+                    const providerVisionModels = providerModels.filter(model => {
+                        const caps = modelsCaps[model];
+                        return caps && caps.vision;
+                    });
+                    
+                    if (providerVisionModels.length > 0) {
+                        const optgroup = document.createElement("optgroup");
+                        optgroup.label = provider.name;
+                        
+                        providerVisionModels.forEach(model => {
+                            const opt = document.createElement("option");
+                            // 保存格式：provider_id:model_name，这样后端可以知道用哪个 provider
+                            opt.value = `${provider.id}:${model}`;
+                            const displayName = modelsNames[model] || model;
+                            opt.textContent = displayName;
+                            optgroup.appendChild(opt);
+                        });
+                        
+                        defaultVisionModelSelect.appendChild(optgroup);
+                    }
+                });
+            } else if (visionModels.length > 0) {
+                // 如果没有 Provider 信息，直接列出所有视觉模型（兼容旧格式）
                 visionModels.forEach(m => {
                     const opt = document.createElement("option");
-                    opt.value = `vision:${m}`;
+                    opt.value = m;
                     const displayName = modelsNames[m] || m;
                     opt.textContent = displayName;
-                    optgroup.appendChild(opt);
+                    defaultVisionModelSelect.appendChild(opt);
                 });
-                ocrMethodSelect.appendChild(optgroup);
             }
             
-            // 恢复之前的选择
+            // 恢复之前的选择或从设置中读取
             if (currentValue) {
-                ocrMethodSelect.value = currentValue;
+                defaultVisionModelSelect.value = currentValue;
+            } else if (currentSettings.default_vision_model) {
+                defaultVisionModelSelect.value = currentSettings.default_vision_model;
             }
-            refreshCustomSelect(ocrMethodSelect);
+            refreshCustomSelect(defaultVisionModelSelect);
         }
     } catch(e) { console.error(e); }
 }
@@ -1265,16 +1790,259 @@ function renderConversationList() {
  * @param {string} content - 消息内容（Markdown 格式）
  * @param {object} tokenInfo - token 统计信息
  * @param {boolean} showFooter - 是否显示底部操作栏
+ * @param {object} extraData - 额外数据 {tool_calls, thinking_content}
  * @returns {HTMLElement} 消息元素
  */
-function appendMessage(role, content, tokenInfo = null, showFooter = true) {
+function appendMessage(role, content, tokenInfo = null, showFooter = true, extraData = null) {
     if (!chatMessagesEl) return null;
     
     const msgEl = document.createElement("div");
     msgEl.className = "message " + (role === "user" ? "message-user" : "message-assistant");
     
     if (role === "assistant") {
-        // AI 消息：使用 Markdown 渲染
+        // AI 消息：创建提示区域和正文区域
+        // 提示区域（用于工具调用、深度思考等提示）
+        const hintsEl = document.createElement("div");
+        hintsEl.className = "message-hints";
+        msgEl.appendChild(hintsEl);
+        
+        // 如果有历史的消息事件，按顺序显示它们
+        if (extraData) {
+            // 优先使用新的 message_events 格式（按时间顺序记录的事件流）
+            if (extraData.message_events) {
+                try {
+                    const events = typeof extraData.message_events === 'string' 
+                        ? JSON.parse(extraData.message_events) 
+                        : extraData.message_events;
+                    
+                    if (events && events.length > 0) {
+                        // 用于合并连续的同类型事件
+                        let toolCallsGroup = [];
+                        let textContentGroup = [];  // 合并连续的 text 事件
+                        
+                        const flushToolCalls = () => {
+                            if (toolCallsGroup.length > 0) {
+                                const toolHint = document.createElement("div");
+                                toolHint.className = "tool-hint completed";
+                                
+                                const toolDetails = document.createElement("details");
+                                toolDetails.className = "tool-details";
+                                
+                                const hasMcpTool = toolCallsGroup.some(tc => tc.name && tc.name.startsWith("mcp_"));
+                                const toolIcon = hasMcpTool ? "🔌" : "🛠️";
+                                
+                                const toolSummary = document.createElement("summary");
+                                toolSummary.innerHTML = `<span class="tool-icon">${toolIcon}</span> <span class="tool-status">工具调用完成 (${toolCallsGroup.length}次)</span>`;
+                                toolDetails.appendChild(toolSummary);
+                                
+                                const toolContent = document.createElement("div");
+                                toolContent.className = "tool-details-content";
+                                toolCallsGroup.forEach((tc, idx) => {
+                                    let displayName = tc.name || '未知工具';
+                                    if (tc.name && tc.name.startsWith("mcp_")) {
+                                        const parts = tc.name.split("_");
+                                        if (parts.length >= 3) {
+                                            displayName = "MCP:" + parts[1] + ":" + parts.slice(2).join("_");
+                                        }
+                                    }
+                                    
+                                    const callDiv = document.createElement("div");
+                                    callDiv.className = "tool-call-item";
+                                    callDiv.innerHTML = `
+                                        <div class="tool-call-name">${idx + 1}. ${displayName}</div>
+                                        <div class="tool-call-args">${typeof tc.args === 'string' ? tc.args : JSON.stringify(tc.args, null, 2)}</div>
+                                        ${tc.result_preview ? `<div class="tool-call-result">结果: ${tc.result_preview}</div>` : ""}
+                                    `;
+                                    toolContent.appendChild(callDiv);
+                                });
+                                toolDetails.appendChild(toolContent);
+                                toolHint.appendChild(toolDetails);
+                                hintsEl.appendChild(toolHint);
+                                toolCallsGroup = [];
+                            }
+                        };
+                        
+                        // 合并并渲染连续的 text 事件
+                        const flushTextContent = () => {
+                            if (textContentGroup.length > 0) {
+                                const combinedText = textContentGroup.join('');
+                                const textBlock = document.createElement("div");
+                                textBlock.className = "text-block markdown-body completed";
+                                if (window.MarkdownEngine && window.MarkdownEngine.renderFinal) {
+                                    window.MarkdownEngine.renderFinal(textBlock, combinedText);
+                                } else {
+                                    textBlock.innerHTML = combinedText.replace(/\n/g, '<br>');
+                                }
+                                hintsEl.appendChild(textBlock);
+                                textContentGroup = [];
+                            }
+                        };
+                        
+                        events.forEach(event => {
+                            if (event.type === "vision") {
+                                flushToolCalls();
+                                flushTextContent();  // 先渲染之前的文本
+                                const visionHint = document.createElement("div");
+                                visionHint.className = "vision-hint completed";
+                                
+                                const visionDetails = document.createElement("details");
+                                visionDetails.className = "vision-details";
+                                
+                                const visionSummary = document.createElement("summary");
+                                visionSummary.innerHTML = `<span class="vision-icon">👁️</span> <span class="vision-status">图片识别完成</span>`;
+                                visionDetails.appendChild(visionSummary);
+                                
+                                const visionContent = document.createElement("div");
+                                visionContent.className = "vision-content";
+                                visionContent.innerHTML = event.content.replace(/\n/g, '<br>');
+                                visionDetails.appendChild(visionContent);
+                                
+                                visionHint.appendChild(visionDetails);
+                                hintsEl.appendChild(visionHint);
+                            } else if (event.type === "tool_call") {
+                                flushTextContent();  // 先渲染之前的文本
+                                // 收集连续的工具调用
+                                toolCallsGroup.push(event.content);
+                            } else if (event.type === "thinking") {
+                                flushToolCalls();
+                                flushTextContent();  // 先渲染之前的文本
+                                const thinkingHint = document.createElement("div");
+                                thinkingHint.className = "thinking-hint completed";
+                                
+                                const thinkingDetails = document.createElement("details");
+                                thinkingDetails.className = "thinking-details";
+                                
+                                const thinkingSummary = document.createElement("summary");
+                                thinkingSummary.innerHTML = `<span class="thinking-icon">🧠</span> <span class="thinking-status">深度思考完成</span>`;
+                                thinkingDetails.appendChild(thinkingSummary);
+                                
+                                const thinkingContent = document.createElement("div");
+                                thinkingContent.className = "thinking-content";
+                                // 使用 Markdown 渲染思考内容
+                                if (window.MarkdownEngine && window.MarkdownEngine.renderFinal) {
+                                    window.MarkdownEngine.renderFinal(thinkingContent, event.content);
+                                } else {
+                                    thinkingContent.innerHTML = event.content.replace(/\n/g, '<br>');
+                                }
+                                thinkingDetails.appendChild(thinkingContent);
+                                
+                                thinkingHint.appendChild(thinkingDetails);
+                                hintsEl.appendChild(thinkingHint);
+                            } else if (event.type === "text") {
+                                flushToolCalls();
+                                // 收集连续的 text 事件，稍后合并渲染
+                                textContentGroup.push(event.content);
+                            }
+                        });
+                        
+                        // 处理剩余的工具调用和文本内容
+                        flushToolCalls();
+                        flushTextContent();
+                    }
+                } catch (e) {
+                    console.warn("解析消息事件失败:", e);
+                }
+            } else {
+                // 回退到旧格式：按固定顺序显示（视觉识别 → 工具调用 → 深度思考）
+                // 1. 首先显示视觉识别历史
+                if (extraData.vision_content) {
+                    const visionHint = document.createElement("div");
+                    visionHint.className = "vision-hint completed";
+                    
+                    const visionDetails = document.createElement("details");
+                    visionDetails.className = "vision-details";
+                    
+                    const visionSummary = document.createElement("summary");
+                    visionSummary.innerHTML = `<span class="vision-icon">👁️</span> <span class="vision-status">图片识别完成</span>`;
+                    visionDetails.appendChild(visionSummary);
+                    
+                    const visionContent = document.createElement("div");
+                    visionContent.className = "vision-content";
+                    visionContent.innerHTML = extraData.vision_content.replace(/\n/g, '<br>');
+                    visionDetails.appendChild(visionContent);
+                    
+                    visionHint.appendChild(visionDetails);
+                    hintsEl.appendChild(visionHint);
+                }
+                
+                // 2. 然后显示工具调用历史
+                if (extraData.tool_calls) {
+                    try {
+                        const toolCalls = typeof extraData.tool_calls === 'string' 
+                            ? JSON.parse(extraData.tool_calls) 
+                            : extraData.tool_calls;
+                        if (toolCalls && toolCalls.length > 0) {
+                            const toolHint = document.createElement("div");
+                            toolHint.className = "tool-hint completed";
+                            
+                            const toolDetails = document.createElement("details");
+                            toolDetails.className = "tool-details";
+                            
+                            const hasMcpTool = toolCalls.some(tc => tc.name && tc.name.startsWith("mcp_"));
+                            const toolIcon = hasMcpTool ? "🔌" : "🛠️";
+                            
+                            const toolSummary = document.createElement("summary");
+                            toolSummary.innerHTML = `<span class="tool-icon">${toolIcon}</span> <span class="tool-status">工具调用完成 (${toolCalls.length}次)</span>`;
+                            toolDetails.appendChild(toolSummary);
+                            
+                            const toolContent = document.createElement("div");
+                            toolContent.className = "tool-details-content";
+                            toolCalls.forEach((tc, idx) => {
+                                let displayName = tc.name || '未知工具';
+                                if (tc.name && tc.name.startsWith("mcp_")) {
+                                    const parts = tc.name.split("_");
+                                    if (parts.length >= 3) {
+                                        displayName = "MCP:" + parts[1] + ":" + parts.slice(2).join("_");
+                                    }
+                                }
+                                
+                                const callDiv = document.createElement("div");
+                                callDiv.className = "tool-call-item";
+                                callDiv.innerHTML = `
+                                    <div class="tool-call-name">${idx + 1}. ${displayName}</div>
+                                    <div class="tool-call-args">${typeof tc.args === 'string' ? tc.args : JSON.stringify(tc.args, null, 2)}</div>
+                                    ${tc.result_preview ? `<div class="tool-call-result">结果: ${tc.result_preview}</div>` : ""}
+                                `;
+                                toolContent.appendChild(callDiv);
+                            });
+                            toolDetails.appendChild(toolContent);
+                            toolHint.appendChild(toolDetails);
+                            hintsEl.appendChild(toolHint);
+                        }
+                    } catch (e) {
+                        console.warn("解析工具调用历史失败:", e);
+                    }
+                }
+                
+                // 3. 最后显示深度思考历史
+                if (extraData.thinking_content) {
+                    const thinkingHint = document.createElement("div");
+                    thinkingHint.className = "thinking-hint completed";
+                    
+                    const thinkingDetails = document.createElement("details");
+                    thinkingDetails.className = "thinking-details";
+                    
+                    const thinkingSummary = document.createElement("summary");
+                    thinkingSummary.innerHTML = `<span class="thinking-icon">🧠</span> <span class="thinking-status">深度思考完成</span>`;
+                    thinkingDetails.appendChild(thinkingSummary);
+                    
+                    const thinkingContent = document.createElement("div");
+                    thinkingContent.className = "thinking-content";
+                    // 使用 Markdown 渲染思考内容
+                    if (window.MarkdownEngine && window.MarkdownEngine.renderFinal) {
+                        window.MarkdownEngine.renderFinal(thinkingContent, extraData.thinking_content);
+                    } else {
+                        thinkingContent.innerHTML = extraData.thinking_content.replace(/\n/g, '<br>');
+                    }
+                    thinkingDetails.appendChild(thinkingContent);
+                    
+                    thinkingHint.appendChild(thinkingDetails);
+                    hintsEl.appendChild(thinkingHint);
+                }
+            }
+        }
+        
+        // 正文区域（用于 Markdown 渲染）
         const contentEl = document.createElement("div");
         contentEl.className = "message-content";
         msgEl.appendChild(contentEl);
@@ -1292,16 +2060,32 @@ function appendMessage(role, content, tokenInfo = null, showFooter = true) {
             addMessageFooter(msgEl, content, tokenInfo);
         }
     } else {
-        // 用户消息：纯文本显示
+        // 用户消息：纯文本显示 + 附件显示
         const textNode = document.createTextNode(content || "");
         msgEl.appendChild(textNode);
+        
+        // 保存文件信息到消息元素上（用于编辑时恢复）
+        if (extraData && extraData.files && extraData.files.length > 0) {
+            msgEl.dataset.files = JSON.stringify(extraData.files);
+            
+            // 显示附件列表
+            const filesEl = document.createElement("div");
+            filesEl.className = "user-message-files";
+            extraData.files.forEach(file => {
+                const fileEl = document.createElement("span");
+                fileEl.className = "user-message-file";
+                fileEl.textContent = `📎 ${file.filename || file.name || '文件'}`;
+                filesEl.appendChild(fileEl);
+            });
+            msgEl.appendChild(filesEl);
+        }
         
         // 添加编辑按钮
         const actionsEl = document.createElement("div");
         actionsEl.className = "user-message-actions";
         const editBtn = document.createElement("button");
         editBtn.textContent = "✏️";
-        editBtn.onclick = () => editAndResendMessage(content);
+        editBtn.onclick = () => editAndResendMessage(content, msgEl.dataset.files);
         actionsEl.appendChild(editBtn);
         msgEl.appendChild(actionsEl);
     }
@@ -1317,9 +2101,38 @@ function appendMessage(role, content, tokenInfo = null, showFooter = true) {
  * @param {string} markdown - Markdown 内容
  * @param {boolean} isComplete - 是否为最终渲染
  */
+// 节流渲染，避免频繁重绘
+let _renderThrottleTimer = null;
+let _pendingRender = null;
+
 function renderMarkdown(el, markdown, isComplete = true) {
     if (!el) return;
     
+    // 最终渲染立即执行
+    if (isComplete) {
+        if (_renderThrottleTimer) {
+            clearTimeout(_renderThrottleTimer);
+            _renderThrottleTimer = null;
+        }
+        _pendingRender = null;
+        _doRenderMarkdown(el, markdown, true);
+        return;
+    }
+    
+    // 流式渲染使用节流（每50ms最多渲染一次）
+    _pendingRender = { el, markdown, isComplete };
+    if (!_renderThrottleTimer) {
+        _renderThrottleTimer = setTimeout(() => {
+            _renderThrottleTimer = null;
+            if (_pendingRender) {
+                _doRenderMarkdown(_pendingRender.el, _pendingRender.markdown, _pendingRender.isComplete);
+                _pendingRender = null;
+            }
+        }, 50);
+    }
+}
+
+function _doRenderMarkdown(el, markdown, isComplete) {
     // 如果 MarkdownEngine 可用且 marked 已加载
     if (window.MarkdownEngine && window.MarkdownEngine.renderToEl && window.MarkdownEngine.isReady && window.MarkdownEngine.isReady()) {
         window.MarkdownEngine.renderToEl(el, markdown, isComplete);
@@ -1379,14 +2192,15 @@ function addMessageFooter(msgEl, content, tokenInfo, isLoading = false) {
     };
     actionsEl.appendChild(copyMdBtn);
     
-    // 纯文本复制按钮
+    // 纯文本复制按钮（去除Markdown符号）
     const copyTxtBtn = document.createElement("button");
     copyTxtBtn.textContent = "📄 纯文本";
     copyTxtBtn.onclick = () => {
-        // 获取当前最新的纯文本内容
-        const contentEl = msgEl.querySelector(".message-content");
-        const currentContent = contentEl ? contentEl.textContent : content;
-        navigator.clipboard.writeText(currentContent).then(() => {
+        // 获取原始Markdown内容
+        const rawContent = msgEl.dataset.rawContent || content;
+        // 去除Markdown符号，转为纯文本
+        const plainText = stripMarkdown(rawContent);
+        navigator.clipboard.writeText(plainText).then(() => {
             const originalText = copyTxtBtn.textContent;
             copyTxtBtn.textContent = "✓ 已复制";
             copyTxtBtn.classList.add("success");
@@ -1492,27 +2306,20 @@ async function regenerateLastMessage() {
     if (providerId !== null && !isNaN(providerId)) {
         formData.append("provider_id", String(providerId));
     }
-    const useStream = toggleStreamEl ? toggleStreamEl.checked : true;
-    formData.append("stream", useStream ? "true" : "false");
+    // 始终使用流式输出
+    formData.append("stream", "true");
     
-    // 直接调用聊天API，不通过sendMessage函数（避免重复添加用户消息）
-    if (!useStream) {
-        try {
-            const res = await fetch(`${apiBase}/conversations/${currentConversationId}/chat`, {
-                method: "POST",
-                body: formData,
-            });
-            
-            if (!res.ok) {
-                const err = await res.text();
-                throw new Error(err || res.statusText);
-            }
-            const data = await res.json();
-            appendMessage("assistant", data.assistant_message.content, data.token_info);
-        } catch (e) {
-            appendMessage("assistant", "[错误] " + e.message);
-        }
-        return;
+    // 深度思考开关
+    const selectedModel = modelSelectEl ? modelSelectEl.value : "";
+    const caps = modelsCaps[selectedModel] || {};
+    if (caps.reasoning && enableThinking) {
+        formData.append("enable_thinking", "true");
+    }
+    
+    // 视觉识别开关
+    const visionToggle = document.getElementById('toggle-vision-recognition');
+    if (visionToggle && visionToggle.checked && !caps.vision && uploadedFiles.length > 0) {
+        formData.append("force_vision_recognition", "true");
     }
     
     // 流式传输
@@ -1528,6 +2335,45 @@ async function regenerateLastMessage() {
     // 用于存储原始markdown内容
     let fullText = "";
     let tokenInfo = null;
+    
+    // 辅助函数：结束当前正文块（如果有的话）
+    const finalizeCurrentTextBlock = () => {
+        const currentTextId = assistantEl.dataset.currentTextId;
+        if (currentTextId) {
+            const textBlock = document.getElementById(currentTextId);
+            if (textBlock) {
+                // 最终渲染 Markdown
+                const rawContent = textBlock.dataset.rawContent || "";
+                if (rawContent && window.MarkdownEngine && window.MarkdownEngine.renderFinal) {
+                    window.MarkdownEngine.renderFinal(textBlock, rawContent);
+                }
+                textBlock.classList.add("completed");
+            }
+            delete assistantEl.dataset.currentTextId;
+        }
+    };
+    
+    // 辅助函数：获取或创建当前正文块
+    const getOrCreateTextBlock = () => {
+        const hintsEl = assistantEl?.querySelector(".message-hints");
+        if (!hintsEl) return null;
+        
+        const currentTextId = assistantEl.dataset.currentTextId;
+        if (currentTextId) {
+            const existing = document.getElementById(currentTextId);
+            if (existing) return existing;
+        }
+        
+        // 创建新的正文块
+        const textId = `text-${Date.now()}`;
+        const textBlock = document.createElement("div");
+        textBlock.className = "text-block markdown-body";
+        textBlock.id = textId;
+        textBlock.dataset.rawContent = "";
+        hintsEl.appendChild(textBlock);
+        assistantEl.dataset.currentTextId = textId;
+        return textBlock;
+    };
     
     try {
         const res = await fetch(`${apiBase}/conversations/${currentConversationId}/chat`, {
@@ -1601,6 +2447,414 @@ async function regenerateLastMessage() {
                     continue;
                 }
 
+                // 处理视觉识别开始事件
+                if (localEventName === "vision_start") {
+                    // 先结束当前正文块
+                    finalizeCurrentTextBlock();
+                    try {
+                        const visionData = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            let visionHint = hintsEl.querySelector(".vision-hint");
+                            if (!visionHint) {
+                                visionHint = document.createElement("div");
+                                visionHint.className = "vision-hint";
+                                hintsEl.appendChild(visionHint);
+                            }
+                            const fileTypeMap = {
+                                "pdf": "PDF",
+                                "image": "图片",
+                                "document": "文档"
+                            };
+                            const fileTypeText = fileTypeMap[visionData.file_type] || "文件";
+                            const statusMessage = visionData.message || `${visionData.model} 正在识别${fileTypeText}...`;
+                            // 创建可展开的折叠框，实时显示识别过程
+                            visionHint.innerHTML = `
+                                <details class="vision-details" open>
+                                    <summary><span class="vision-icon">👁️</span> <span class="vision-status">${statusMessage}</span></summary>
+                                    <div class="vision-content"></div>
+                                </details>
+                            `;
+                            scrollToBottom();
+                        }
+                    } catch (e) {
+                        console.error("解析视觉识别开始事件失败:", e);
+                    }
+                    continue;
+                }
+
+                // 处理视觉识别进度事件
+                if (localEventName === "vision_progress") {
+                    try {
+                        const progressData = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            const visionStatus = hintsEl.querySelector(".vision-hint .vision-status");
+                            if (visionStatus && progressData.message) {
+                                // 更新状态文本
+                                const modelName = visionStatus.textContent.split(" ")[0];
+                                visionStatus.textContent = `${modelName} ${progressData.message}`;
+                            }
+                        }
+                    } catch (e) {}
+                    continue;
+                }
+
+                // 处理视觉识别内容块事件（实时追加到折叠框中）
+                if (localEventName === "vision_chunk") {
+                    try {
+                        const chunkText = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            const visionContent = hintsEl.querySelector(".vision-hint .vision-content");
+                            if (visionContent && chunkText) {
+                                // 追加识别内容
+                                visionContent.innerHTML += chunkText.replace(/\n/g, '<br>');
+                                scrollToBottom();
+                            }
+                        }
+                    } catch (e) {}
+                    continue;
+                }
+
+                // 处理视觉识别结束事件
+                if (localEventName === "vision_end") {
+                    try {
+                        const visionData = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            let visionHint = hintsEl.querySelector(".vision-hint");
+                            if (visionHint) {
+                                // 获取已有的识别内容
+                                const existingContent = visionHint.querySelector(".vision-content")?.innerHTML || "";
+                                const fileTypeMap = {
+                                    "pdf": "PDF",
+                                    "image": "图片",
+                                    "document": "文档"
+                                };
+                                const fileTypeText = fileTypeMap[visionData.file_type] || "文件";
+                                
+                                // 更新为完成状态（默认折叠）
+                                visionHint.innerHTML = `
+                                    <details class="vision-details">
+                                        <summary><span class="vision-icon">👁️</span> ${fileTypeText}识别完成</summary>
+                                        <div class="vision-content">${existingContent}</div>
+                                    </details>
+                                `;
+                                visionHint.classList.add("completed");
+                                scrollToBottom();
+                            }
+                        }
+                    } catch (e) {
+                        console.error("解析视觉识别结束事件失败:", e);
+                    }
+                    continue;
+                }
+
+                // 处理深度思考开始事件
+                if (localEventName === "thinking_start") {
+                    // 先结束当前正文块
+                    finalizeCurrentTextBlock();
+                    try {
+                        const thinkingData = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            // 每次都创建新的思考块，使用时间戳作为唯一ID
+                            const thinkingId = `thinking-${Date.now()}`;
+                            const thinkingHint = document.createElement("div");
+                            thinkingHint.className = "thinking-hint";
+                            thinkingHint.id = thinkingId;
+                            thinkingHint.dataset.rawThinking = "";
+                            hintsEl.appendChild(thinkingHint);
+                            
+                            // 记录当前活跃的思考块ID
+                            assistantEl.dataset.currentThinkingId = thinkingId;
+                            
+                            // 创建可展开的折叠框，实时显示思考过程
+                            thinkingHint.innerHTML = `
+                                <details class="thinking-details" open>
+                                    <summary><span class="thinking-icon">🧠</span> <span class="thinking-status">${thinkingData.message || "正在深度思考..."}</span></summary>
+                                    <div class="thinking-content"></div>
+                                </details>
+                            `;
+                            scrollToBottom();
+                        }
+                    } catch (e) {}
+                    continue;
+                }
+
+                // 处理深度思考内容事件（实时追加到当前活跃的思考块中）
+                if (localEventName === "thinking") {
+                    try {
+                        const thinkingText = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl && thinkingText) {
+                            // 获取当前活跃的思考块
+                            const currentThinkingId = assistantEl.dataset.currentThinkingId;
+                            let thinkingHint = currentThinkingId ? document.getElementById(currentThinkingId) : null;
+                            
+                            // 如果没有活跃的思考块，创建一个新的
+                            if (!thinkingHint) {
+                                const thinkingId = `thinking-${Date.now()}`;
+                                thinkingHint = document.createElement("div");
+                                thinkingHint.className = "thinking-hint";
+                                thinkingHint.id = thinkingId;
+                                thinkingHint.dataset.rawThinking = "";
+                                thinkingHint.innerHTML = `
+                                    <details class="thinking-details" open>
+                                        <summary><span class="thinking-icon">🧠</span> <span class="thinking-status">正在深度思考...</span></summary>
+                                        <div class="thinking-content"></div>
+                                    </details>
+                                `;
+                                hintsEl.appendChild(thinkingHint);
+                                assistantEl.dataset.currentThinkingId = thinkingId;
+                            }
+                            
+                            // 保存原始文本用于最后的 Markdown 渲染
+                            thinkingHint.dataset.rawThinking = (thinkingHint.dataset.rawThinking || "") + thinkingText;
+                            
+                            // 实时显示（简单换行处理）
+                            const thinkingContent = thinkingHint.querySelector(".thinking-content");
+                            if (thinkingContent) {
+                                thinkingContent.innerHTML += thinkingText.replace(/\n/g, '<br>');
+                                scrollToBottom();
+                            }
+                        }
+                    } catch (e) {}
+                    continue;
+                }
+
+                // 处理深度思考结束事件
+                if (localEventName === "thinking_end") {
+                    try {
+                        const thinkingData = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            // 获取当前活跃的思考块
+                            const currentThinkingId = assistantEl.dataset.currentThinkingId;
+                            let thinkingHint = currentThinkingId ? document.getElementById(currentThinkingId) : null;
+                            
+                            if (!thinkingHint) {
+                                // 如果没有活跃的思考块，创建一个新的
+                                const thinkingId = `thinking-${Date.now()}`;
+                                thinkingHint = document.createElement("div");
+                                thinkingHint.className = "thinking-hint";
+                                thinkingHint.id = thinkingId;
+                                hintsEl.appendChild(thinkingHint);
+                            }
+                            
+                            // 获取已有的思考内容（原始文本）
+                            const existingRawContent = thinkingHint.dataset.rawThinking || "";
+                            const rawContent = existingRawContent || thinkingData.thinking || "思考过程未记录";
+                            
+                            // 更新为完成状态（默认折叠）
+                            thinkingHint.innerHTML = `
+                                <details class="thinking-details">
+                                    <summary><span class="thinking-icon">🧠</span> 深度思考完成</summary>
+                                    <div class="thinking-content markdown-body"></div>
+                                </details>
+                            `;
+                            thinkingHint.classList.add("completed");
+                            
+                            // 使用 Markdown 渲染思考内容
+                            const thinkingContentEl = thinkingHint.querySelector('.thinking-content');
+                            if (thinkingContentEl) {
+                                if (window.MarkdownEngine && window.MarkdownEngine.renderFinal) {
+                                    window.MarkdownEngine.renderFinal(thinkingContentEl, rawContent);
+                                } else {
+                                    thinkingContentEl.innerHTML = rawContent.replace(/\n/g, '<br>');
+                                }
+                            }
+                            
+                            // 清除当前活跃的思考块ID，以便下次创建新的
+                            delete assistantEl.dataset.currentThinkingId;
+                            
+                            scrollToBottom();
+                        }
+                    } catch (e) {
+                        console.error("解析思考结束事件失败:", e);
+                    }
+                    continue;
+                }
+
+                // 处理工具调用开始事件
+                if (localEventName === "tool_start") {
+                    // 先结束当前正文块
+                    finalizeCurrentTextBlock();
+                    try {
+                        const toolData = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            // 每次都创建新的工具块，使用时间戳作为唯一ID
+                            const toolId = `tool-${Date.now()}`;
+                            const toolHint = document.createElement("div");
+                            toolHint.className = "tool-hint";
+                            toolHint.id = toolId;
+                            hintsEl.appendChild(toolHint);
+                            
+                            // 记录当前活跃的工具块ID
+                            assistantEl.dataset.currentToolId = toolId;
+                            
+                            const toolMessages = {
+                                "thinking": "正在分析问题...",
+                                "search_knowledge": "正在查询知识库...",
+                                "web_search": "正在联网搜索...",
+                                "deep_thinking": "正在深度思考...",
+                                "mcp": "正在调用工具..."
+                            };
+                            const toolIcons = {
+                                "thinking": "🔍",
+                                "search_knowledge": "📚",
+                                "web_search": "🌐",
+                                "deep_thinking": "🧠",
+                                "mcp": "🔧"
+                            };
+                            const msg = toolMessages[toolData.status] || toolData.message || "正在处理...";
+                            const icon = toolIcons[toolData.status] || "🔍";
+                            toolHint.innerHTML = `<span class="tool-icon">${icon}</span> <span class="tool-status">${msg}</span><div class="tool-progress-list"></div>`;
+                            scrollToBottom();
+                        }
+                    } catch (e) {}
+                    continue;
+                }
+
+                // 处理工具调用进度事件（实时显示每次搜索）
+                if (localEventName === "tool_progress") {
+                    try {
+                        const progressData = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            // 获取当前活跃的工具块
+                            const currentToolId = assistantEl.dataset.currentToolId;
+                            let toolHint = currentToolId ? document.getElementById(currentToolId) : null;
+                            
+                            // 如果没有活跃的工具块，创建一个新的
+                            if (!toolHint) {
+                                const toolId = `tool-${Date.now()}`;
+                                toolHint = document.createElement("div");
+                                toolHint.className = "tool-hint";
+                                toolHint.id = toolId;
+                                toolHint.innerHTML = `<span class="tool-icon">🔍</span> <span class="tool-status">正在处理...</span><div class="tool-progress-list"></div>`;
+                                hintsEl.appendChild(toolHint);
+                                assistantEl.dataset.currentToolId = toolId;
+                            }
+                            
+                            let progressList = toolHint.querySelector(".tool-progress-list");
+                            if (!progressList) {
+                                progressList = document.createElement("div");
+                                progressList.className = "tool-progress-list";
+                                toolHint.appendChild(progressList);
+                            }
+                            
+                            if (progressData.stage === "start") {
+                                // 添加新的进度项
+                                const progressItem = document.createElement("div");
+                                progressItem.className = "tool-progress-item";
+                                progressItem.dataset.tool = progressData.tool;
+                                progressItem.innerHTML = `<span class="progress-icon">⏳</span> ${progressData.message}`;
+                                progressList.appendChild(progressItem);
+                            } else if (progressData.stage === "done") {
+                                // 更新最后一个进度项为完成状态
+                                const items = progressList.querySelectorAll(".tool-progress-item");
+                                if (items.length > 0) {
+                                    const lastItem = items[items.length - 1];
+                                    lastItem.innerHTML = `<span class="progress-icon">✓</span> ${progressData.message}`;
+                                    lastItem.classList.add("done");
+                                }
+                            } else if (progressData.stage === "error") {
+                                // 更新为错误状态
+                                const items = progressList.querySelectorAll(".tool-progress-item");
+                                if (items.length > 0) {
+                                    const lastItem = items[items.length - 1];
+                                    lastItem.innerHTML = `<span class="progress-icon">✗</span> ${progressData.message}`;
+                                    lastItem.classList.add("error");
+                                }
+                            }
+                            scrollToBottom();
+                        }
+                    } catch (e) {
+                        console.error("解析工具进度事件失败:", e);
+                    }
+                    continue;
+                }
+
+                // 处理工具调用结束事件
+                if (localEventName === "tool_end") {
+                    try {
+                        const toolData = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            // 获取当前活跃的工具块
+                            const currentToolId = assistantEl.dataset.currentToolId;
+                            let toolHint = currentToolId ? document.getElementById(currentToolId) : null;
+                            
+                            // 如果模型跳过了工具调用，直接移除当前工具提示
+                            if (toolData.status === "skipped") {
+                                if (toolHint) {
+                                    toolHint.remove();
+                                }
+                                delete assistantEl.dataset.currentToolId;
+                                scrollToBottom();
+                                continue;
+                            }
+                            
+                            if (!toolHint) {
+                                const toolId = `tool-${Date.now()}`;
+                                toolHint = document.createElement("div");
+                                toolHint.className = "tool-hint";
+                                toolHint.id = toolId;
+                                hintsEl.appendChild(toolHint);
+                            }
+                            
+                            if (toolData.tools && toolData.tools.length > 0) {
+                                const toolCount = toolData.tools.length;
+                                
+                                // 判断是否包含 MCP 工具
+                                const hasMcpTool = toolData.tools.some(t => t.name && t.name.startsWith("mcp_"));
+                                const toolIcon = hasMcpTool ? "🔌" : "🛠️";
+                                
+                                const htmlContent = `
+                                    <details class="tool-details">
+                                        <summary><span class="tool-icon">${toolIcon}</span> <span class="tool-status">工具调用完成 (${toolCount}次)</span></summary>
+                                        <div class="tool-details-content">
+                                            ${toolData.tools.map((t, idx) => {
+                                                // 格式化 MCP 工具名称显示
+                                                let displayName = t.name;
+                                                if (t.name && t.name.startsWith("mcp_")) {
+                                                    const parts = t.name.split("_");
+                                                    if (parts.length >= 3) {
+                                                        displayName = "MCP:" + parts[1] + ":" + parts.slice(2).join("_");
+                                                    }
+                                                }
+                                                return '<div class="tool-call-item">' +
+                                                    '<div class="tool-call-name">' + (idx + 1) + '. ' + displayName + '</div>' +
+                                                    '<div class="tool-call-args">' + JSON.stringify(t.args, null, 2) + '</div>' +
+                                                    (t.result_preview ? '<div class="tool-call-result">结果: ' + t.result_preview + '</div>' : '') +
+                                                    (t.error ? '<div class="tool-call-error">错误: ' + t.error + '</div>' : '') +
+                                                '</div>';
+                                            }).join("")}
+                                        </div>
+                                    </details>
+                                `;
+                                
+                                toolHint.innerHTML = htmlContent;
+                                toolHint.classList.add("completed");
+                            } else {
+                                // 没有工具调用，移除提示
+                                toolHint.remove();
+                            }
+                            
+                            // 清除当前活跃的工具块ID，以便下次创建新的
+                            delete assistantEl.dataset.currentToolId;
+                            
+                            scrollToBottom();
+                        }
+                    } catch (e) {
+                        console.error("解析工具结束事件失败:", e);
+                    }
+                    continue;
+                }
+
                 // message 正文
                 if (payload === "[DONE]") {
                     streamDone = true;
@@ -1620,6 +2874,24 @@ async function regenerateLastMessage() {
                     continue;
                 }
                 
+                // 过滤掉工具调用相关的 JSON（不应该显示在消息内容中）
+                // 检测 tool_start 事件的数据格式
+                if (payload.includes('"status"') && (payload.includes('"search_knowledge"') || payload.includes('"web_search"') || payload.includes('"thinking"') || payload.includes('"done"'))) {
+                    continue;
+                }
+                // 检测 tool_end 事件的数据格式
+                if (payload.includes('"tools"') && payload.includes('[')) {
+                    continue;
+                }
+                // 检测包含 message 字段的工具提示
+                if (payload.includes('"message"') && (payload.includes('正在') || payload.includes('深度思考') || payload.includes('查询') || payload.includes('搜索'))) {
+                    continue;
+                }
+                // 检测深度思考内容
+                if (payload.includes('"thinking"') && payload.includes(':')) {
+                    continue;
+                }
+                
                 // 尝试解析 JSON 文本块（后端用 JSON 发送以保留换行）
                 let parsedPayload = payload;
                 try {
@@ -1634,13 +2906,16 @@ async function regenerateLastMessage() {
                 }
                 
                 if (parsedPayload) {
-                    // 流式处理：累积内容并实时渲染
+                    // 流式处理：累积内容到当前正文块
                     fullText += parsedPayload;
                     assistantEl.dataset.rawContent = fullText;
                     
-                    const contentEl = assistantEl.querySelector(".message-content");
-                    if (contentEl) {
-                        renderMarkdown(contentEl, fullText, false);
+                    // 获取或创建当前正文块
+                    const textBlock = getOrCreateTextBlock();
+                    if (textBlock) {
+                        textBlock.dataset.rawContent = (textBlock.dataset.rawContent || "") + parsedPayload;
+                        // 实时渲染（简单处理）
+                        renderMarkdown(textBlock, textBlock.dataset.rawContent, false);
                         scrollToBottom();
                     }
                 }
@@ -1649,14 +2924,40 @@ async function regenerateLastMessage() {
         }
 
         // 流式输出完成后，进行最终渲染
+        // 先结束当前正文块
+        finalizeCurrentTextBlock();
+        
         if (assistantEl) {
             assistantEl.dataset.rawContent = fullText;
-            const contentEl = assistantEl.querySelector(".message-content");
             
             if (window.MarkdownEngine && window.MarkdownEngine.cancelRender) {
-                window.MarkdownEngine.cancelRender(contentEl);
+                // 取消所有正文块的渲染
+                const textBlocks = assistantEl.querySelectorAll(".text-block");
+                textBlocks.forEach(block => {
+                    window.MarkdownEngine.cancelRender(block);
+                });
             }
             
+            // 最终渲染所有正文块
+            const textBlocks = assistantEl.querySelectorAll(".text-block");
+            textBlocks.forEach(block => {
+                const rawContent = block.dataset.rawContent || "";
+                if (rawContent) {
+                    renderMarkdown(block, rawContent, true);
+                }
+            });
+            
+            // 最终渲染所有思考内容块
+            const thinkingContents = assistantEl.querySelectorAll(".thinking-content");
+            thinkingContents.forEach(el => {
+                const rawContent = el.dataset.rawThinking || el.textContent;
+                if (rawContent && window.MarkdownEngine && window.MarkdownEngine.renderFinal) {
+                    window.MarkdownEngine.renderFinal(el, rawContent);
+                }
+            });
+            
+            // 最终渲染主内容区域
+            const contentEl = assistantEl.querySelector(".message-content");
             if (contentEl && fullText) {
                 renderMarkdown(contentEl, fullText, true);
             }
@@ -1674,13 +2975,15 @@ async function regenerateLastMessage() {
 
     } catch (e) {
         if (e.name !== 'AbortError') {
-            const contentEl = assistantEl ? assistantEl.querySelector(".message-content") : null;
-            if (contentEl) {
-                contentEl.innerHTML += "<br><span style='color:red;'>[请求异常] " + e.message + "</span>";
+            // 在最后一个正文块中显示错误
+            const textBlock = getOrCreateTextBlock();
+            if (textBlock) {
+                textBlock.innerHTML += "<br><span style='color:red;'>[请求异常] " + e.message + "</span>";
             }
-            if (assistantEl) {
-                addMessageFooter(assistantEl, fullText, null, false);
-            }
+        }
+        // 无论是否是 AbortError，都添加消息底部操作按钮
+        if (assistantEl && !assistantEl.querySelector(".message-footer")) {
+            addMessageFooter(assistantEl, fullText, null, false);
         }
     } finally {
         isStreaming = false;
@@ -1693,7 +2996,7 @@ async function regenerateLastMessage() {
 // 工具函数 - 现在使用 MarkdownEngine 模块中的函数
 
 // 修改并重新发送消息
-function editAndResendMessage(originalText) {
+function editAndResendMessage(originalText, filesJson) {
     // 将原文本填入输入框
     if (userInputEl) {
         userInputEl.value = originalText;
@@ -1702,6 +3005,25 @@ function editAndResendMessage(originalText) {
         
         // 聚焦到输入框
         userInputEl.focus();
+    }
+    
+    // 恢复文件到输入框上方
+    if (filesJson) {
+        try {
+            const files = JSON.parse(filesJson);
+            if (files && files.length > 0) {
+                uploadedFiles = files.map(f => ({
+                    id: f.id,
+                    filename: f.filename || f.name,
+                    filepath: f.filepath,
+                    uploading: false
+                }));
+                renderUploadedFiles();
+                updateVisionToggleVisibility();
+            }
+        } catch (e) {
+            console.error('解析文件信息失败:', e);
+        }
     }
     
     // 删除最后一条AI回复（如果存在）
@@ -1722,9 +3044,40 @@ function stopStreaming() {
         currentStreamController.abort();
         currentStreamController = null;
     }
+    
+    // 保存已输出的部分内容
+    if (currentStreamingMessageEl && currentConversationId) {
+        const content = currentStreamingMessageEl.dataset.rawContent || '';
+        const thinkingEl = currentStreamingMessageEl.querySelector('.thinking-content');
+        const thinkingContent = thinkingEl ? thinkingEl.textContent : '';
+        const model = modelSelectEl ? modelSelectEl.value : '';
+        
+        if (content && content.trim()) {
+            // 异步保存，不阻塞 UI
+            savePartialMessage(currentConversationId, content, model, thinkingContent);
+        }
+    }
+    
     isStreaming = false;
     currentStreamingMessageEl = null;
     updateSendButton();
+}
+
+// 保存部分消息（用户中断时）
+async function savePartialMessage(conversationId, content, model, thinkingContent) {
+    try {
+        const formData = new FormData();
+        formData.append('content', content);
+        if (model) formData.append('model', model);
+        if (thinkingContent) formData.append('thinking_content', thinkingContent);
+        
+        await fetch(`${apiBase}/conversations/${conversationId}/messages/partial`, {
+            method: 'POST',
+            body: formData
+        });
+    } catch (e) {
+        console.warn('保存部分消息失败:', e);
+    }
 }
 
 // 更新发送按钮状态
@@ -1772,7 +3125,22 @@ async function sendMessage() {
     
     userInputEl.value = "";
     resetInputHeight();
-    appendMessage("user", text);
+    
+    // 传递当前上传的文件列表给用户消息显示
+    const filesForDisplay = uploadedFiles.length > 0 ? { files: [...uploadedFiles] } : null;
+    const hadUploadedFiles = uploadedFiles.length > 0;  // 保存文件状态
+    
+    // 在清空文件之前，保存视觉识别开关的状态（因为updateVisionToggleVisibility会取消勾选）
+    const visionToggle = document.getElementById('toggle-vision-recognition');
+    const forceVisionRecognition = visionToggle && visionToggle.checked && hadUploadedFiles;
+    
+    appendMessage("user", text, null, true, filesForDisplay);
+    
+    // 清空文件预览（文件已关联到对话，不需要再显示）
+    uploadedFiles = [];
+    renderUploadedFiles();
+    updateVisionToggleVisibility();
+    
     maybeAutoTitleConversation(text);
     
     const formData = new FormData();
@@ -1795,33 +3163,19 @@ async function sendMessage() {
         formData.append("provider_id", String(providerId));
     }
     
-    const useStream = toggleStreamEl ? toggleStreamEl.checked : true;
-    formData.append("stream", useStream ? "true" : "false");
+    // 始终使用流式输出
+    formData.append("stream", "true");
     
-    // 检查是否是第一次对话（用于自动命名） 功能暂时禁用，等待后续实现
-    // const conversation = conversations.find(c => c.id === currentConversationId);
-    // const isFirstMessage = conversation && (conversation.title === "新对话" || conversation.title === "无标题对话");
+    // 深度思考开关（仅当模型支持推理时有效）
+    const selectedModel = modelSelectEl ? modelSelectEl.value : "";
+    const caps = modelsCaps[selectedModel] || {};
+    if (caps.reasoning && enableThinking) {
+        formData.append("enable_thinking", "true");
+    }
     
-    if (!useStream) {
-        try {
-            const res = await fetch(`${apiBase}/conversations/${currentConversationId}/chat`, {
-                method: "POST",
-                body: formData,
-            });
-            
-            if (!res.ok) {
-                const err = await res.text();
-                throw new Error(err || res.statusText);
-            }
-            const data = await res.json();
-            
-            appendMessage("assistant", data.assistant_message.content, data.token_info);
-            maybeAutoTitleConversation();
-        } catch (e) {
-            appendMessage("assistant", "[错误] " + e.message);
-        }
-        return;
-
+    // 视觉识别开关（使用之前保存的状态，因为updateVisionToggleVisibility已经取消勾选了）
+    if (forceVisionRecognition && !caps.vision) {
+        formData.append("force_vision_recognition", "true");
     }
     
     // 流式传输
@@ -1836,6 +3190,45 @@ async function sendMessage() {
     // 用于存储原始markdown内容
     let fullText = "";
     let tokenInfo = null;
+    
+    // 辅助函数：结束当前正文块（如果有的话）
+    const finalizeCurrentTextBlock = () => {
+        const currentTextId = assistantEl.dataset.currentTextId;
+        if (currentTextId) {
+            const textBlock = document.getElementById(currentTextId);
+            if (textBlock) {
+                // 最终渲染 Markdown
+                const rawContent = textBlock.dataset.rawContent || "";
+                if (rawContent && window.MarkdownEngine && window.MarkdownEngine.renderFinal) {
+                    window.MarkdownEngine.renderFinal(textBlock, rawContent);
+                }
+                textBlock.classList.add("completed");
+            }
+            delete assistantEl.dataset.currentTextId;
+        }
+    };
+    
+    // 辅助函数：获取或创建当前正文块
+    const getOrCreateTextBlock = () => {
+        const hintsEl = assistantEl?.querySelector(".message-hints");
+        if (!hintsEl) return null;
+        
+        const currentTextId = assistantEl.dataset.currentTextId;
+        if (currentTextId) {
+            const existing = document.getElementById(currentTextId);
+            if (existing) return existing;
+        }
+        
+        // 创建新的正文块
+        const textId = `text-${Date.now()}`;
+        const textBlock = document.createElement("div");
+        textBlock.className = "text-block markdown-body";
+        textBlock.id = textId;
+        textBlock.dataset.rawContent = "";
+        hintsEl.appendChild(textBlock);
+        assistantEl.dataset.currentTextId = textId;
+        return textBlock;
+    };
     
     try {
         const res = await fetch(`${apiBase}/conversations/${currentConversationId}/chat`, {
@@ -1897,6 +3290,14 @@ async function sendMessage() {
                 
                 if (!payload) continue;
                 
+                // 调试：打印所有非 message 事件
+                if (eventName !== "message") {
+                    console.log("[SSE] 事件类型:", eventName, "payload:", payload.substring(0, 100));
+                } else {
+                    // 也打印 message 事件的前100个字符，帮助调试
+                    console.log("[SSE] message 事件:", payload.substring(0, 100));
+                }
+                
                 if (eventName === "meta") {
                     try { 
                         tokenInfo = JSON.parse(payload);
@@ -1908,9 +3309,439 @@ async function sendMessage() {
                     continue;
                 }
                 
+                // 处理深度思考开始事件
+                if (eventName === "thinking_start") {
+                    // 先结束当前正文块
+                    finalizeCurrentTextBlock();
+                    try {
+                        const thinkingData = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            // 每次都创建新的思考块，使用时间戳作为唯一ID
+                            const thinkingId = `thinking-${Date.now()}`;
+                            const thinkingHint = document.createElement("div");
+                            thinkingHint.className = "thinking-hint";
+                            thinkingHint.id = thinkingId;
+                            thinkingHint.dataset.rawThinking = "";
+                            hintsEl.appendChild(thinkingHint);
+                            
+                            // 记录当前活跃的思考块ID
+                            assistantEl.dataset.currentThinkingId = thinkingId;
+                            
+                            // 创建可展开的折叠框，实时显示思考过程
+                            thinkingHint.innerHTML = `
+                                <details class="thinking-details" open>
+                                    <summary><span class="thinking-icon">🧠</span> <span class="thinking-status">${thinkingData.message || "正在深度思考..."}</span></summary>
+                                    <div class="thinking-content"></div>
+                                </details>
+                            `;
+                            scrollToBottom();
+                        }
+                    } catch (e) {}
+                    continue;
+                }
+
+                // 处理深度思考内容事件（实时追加到当前活跃的思考块中）
+                if (eventName === "thinking") {
+                    console.log("[SSE] 收到 thinking 事件");
+                    try {
+                        const thinkingText = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl && thinkingText) {
+                            // 获取当前活跃的思考块
+                            const currentThinkingId = assistantEl.dataset.currentThinkingId;
+                            let thinkingHint = currentThinkingId ? document.getElementById(currentThinkingId) : null;
+                            
+                            // 如果没有活跃的思考块，创建一个新的
+                            if (!thinkingHint) {
+                                const thinkingId = `thinking-${Date.now()}`;
+                                thinkingHint = document.createElement("div");
+                                thinkingHint.className = "thinking-hint";
+                                thinkingHint.id = thinkingId;
+                                thinkingHint.dataset.rawThinking = "";
+                                thinkingHint.innerHTML = `
+                                    <details class="thinking-details" open>
+                                        <summary><span class="thinking-icon">🧠</span> <span class="thinking-status">正在深度思考...</span></summary>
+                                        <div class="thinking-content"></div>
+                                    </details>
+                                `;
+                                hintsEl.appendChild(thinkingHint);
+                                assistantEl.dataset.currentThinkingId = thinkingId;
+                            }
+                            
+                            if (thinkingHint && thinkingText) {
+                                // 保存原始文本用于最后的 Markdown 渲染
+                                thinkingHint.dataset.rawThinking = (thinkingHint.dataset.rawThinking || "") + thinkingText;
+                                
+                                // 实时显示（简单换行处理）
+                                const thinkingContent = thinkingHint.querySelector(".thinking-content");
+                                if (thinkingContent) {
+                                    thinkingContent.innerHTML += thinkingText.replace(/\n/g, '<br>');
+                                    scrollToBottom();
+                                }
+                            }
+                        }
+                    } catch (e) {}
+                    continue;
+                }
+
+                // 处理深度思考结束事件
+                if (eventName === "thinking_end") {
+                    console.log("[SSE] 收到 thinking_end 事件");
+                    try {
+                        const thinkingData = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            // 获取当前活跃的思考块
+                            const currentThinkingId = assistantEl.dataset.currentThinkingId;
+                            let thinkingHint = currentThinkingId ? document.getElementById(currentThinkingId) : null;
+                            
+                            if (!thinkingHint) {
+                                // 如果没有活跃的思考块，创建一个新的
+                                const thinkingId = `thinking-${Date.now()}`;
+                                thinkingHint = document.createElement("div");
+                                thinkingHint.className = "thinking-hint";
+                                thinkingHint.id = thinkingId;
+                                hintsEl.appendChild(thinkingHint);
+                            }
+                            
+                            // 获取已有的思考内容（原始文本）
+                            const existingRawContent = thinkingHint.dataset.rawThinking || "";
+                            const rawContent = existingRawContent || thinkingData.thinking || "思考过程未记录";
+                            
+                            // 更新为完成状态（默认折叠）
+                            thinkingHint.innerHTML = `
+                                <details class="thinking-details">
+                                    <summary><span class="thinking-icon">🧠</span> 深度思考完成</summary>
+                                    <div class="thinking-content markdown-body"></div>
+                                </details>
+                            `;
+                            thinkingHint.classList.add("completed");
+                            
+                            // 使用 Markdown 渲染思考内容
+                            const thinkingContentEl = thinkingHint.querySelector('.thinking-content');
+                            if (thinkingContentEl) {
+                                if (window.MarkdownEngine && window.MarkdownEngine.renderFinal) {
+                                    window.MarkdownEngine.renderFinal(thinkingContentEl, rawContent);
+                                } else {
+                                    thinkingContentEl.innerHTML = rawContent.replace(/\n/g, '<br>');
+                                }
+                            }
+                            
+                            // 清除当前活跃的思考块ID，以便下次创建新的
+                            delete assistantEl.dataset.currentThinkingId;
+                            
+                            scrollToBottom();
+                        }
+                    } catch (e) {}
+                    continue;
+                }
+
+                // 处理工具调用开始事件
+                if (eventName === "tool_start") {
+                    console.log("[SSE] 收到 tool_start 事件");
+                    // 先结束当前正文块
+                    finalizeCurrentTextBlock();
+                    try {
+                        const toolData = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            // 每次都创建新的工具块，使用时间戳作为唯一ID
+                            const toolId = `tool-${Date.now()}`;
+                            const toolHint = document.createElement("div");
+                            toolHint.className = "tool-hint";
+                            toolHint.id = toolId;
+                            hintsEl.appendChild(toolHint);
+                            
+                            // 记录当前活跃的工具块ID
+                            assistantEl.dataset.currentToolId = toolId;
+                            
+                            const toolMessages = {
+                                "thinking": "正在分析问题...",
+                                "search_knowledge": "正在查询知识库...",
+                                "web_search": "正在联网搜索...",
+                                "deep_thinking": "正在深度思考...",
+                                "mcp": "正在调用工具..."
+                            };
+                            const toolIcons = {
+                                "thinking": "🔍",
+                                "search_knowledge": "📚",
+                                "web_search": "🌐",
+                                "deep_thinking": "🧠",
+                                "mcp": "🔧"
+                            };
+                            const msg = toolMessages[toolData.status] || toolData.message || "正在处理...";
+                            const icon = toolIcons[toolData.status] || "🔍";
+                            toolHint.innerHTML = `<span class="tool-icon">${icon}</span> <span class="tool-status">${msg}</span><div class="tool-progress-list"></div>`;
+                            scrollToBottom();
+                        }
+                    } catch (e) {}
+                    continue;
+                }
+
+                // 处理工具调用进度事件（实时显示每次搜索）
+                if (eventName === "tool_progress") {
+                    console.log("[SSE] 收到 tool_progress 事件");
+                    try {
+                        const progressData = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            // 获取当前活跃的工具块
+                            const currentToolId = assistantEl.dataset.currentToolId;
+                            let toolHint = currentToolId ? document.getElementById(currentToolId) : null;
+                            
+                            // 如果没有活跃的工具块，创建一个新的
+                            if (!toolHint) {
+                                const toolId = `tool-${Date.now()}`;
+                                toolHint = document.createElement("div");
+                                toolHint.className = "tool-hint";
+                                toolHint.id = toolId;
+                                toolHint.innerHTML = `<span class="tool-icon">🔍</span> <span class="tool-status">正在处理...</span><div class="tool-progress-list"></div>`;
+                                hintsEl.appendChild(toolHint);
+                                assistantEl.dataset.currentToolId = toolId;
+                            }
+                            
+                            let progressList = toolHint.querySelector(".tool-progress-list");
+                            if (!progressList) {
+                                progressList = document.createElement("div");
+                                progressList.className = "tool-progress-list";
+                                toolHint.appendChild(progressList);
+                            }
+                            
+                            if (progressData.stage === "start") {
+                                // 添加新的进度项
+                                const progressItem = document.createElement("div");
+                                progressItem.className = "tool-progress-item";
+                                progressItem.dataset.tool = progressData.tool;
+                                progressItem.innerHTML = `<span class="progress-icon">⏳</span> ${progressData.message}`;
+                                progressList.appendChild(progressItem);
+                            } else if (progressData.stage === "done") {
+                                // 更新最后一个进度项为完成状态
+                                const items = progressList.querySelectorAll(".tool-progress-item");
+                                if (items.length > 0) {
+                                    const lastItem = items[items.length - 1];
+                                    lastItem.innerHTML = `<span class="progress-icon">✓</span> ${progressData.message}`;
+                                    lastItem.classList.add("done");
+                                }
+                            } else if (progressData.stage === "error") {
+                                // 更新为错误状态
+                                const items = progressList.querySelectorAll(".tool-progress-item");
+                                if (items.length > 0) {
+                                    const lastItem = items[items.length - 1];
+                                    lastItem.innerHTML = `<span class="progress-icon">✗</span> ${progressData.message}`;
+                                    lastItem.classList.add("error");
+                                }
+                            }
+                            scrollToBottom();
+                        }
+                    } catch (e) {
+                        console.error("解析工具进度事件失败:", e);
+                    }
+                    continue;
+                }
+
+                // 处理工具调用结束事件
+                if (eventName === "tool_end") {
+                    console.log("[SSE-2] 收到 tool_end 事件");
+                    try {
+                        const toolData = JSON.parse(payload);
+                        console.log("[tool_end-2] 解析的数据:", toolData);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        console.log("[tool_end-2] hintsEl:", hintsEl);
+                        if (hintsEl) {
+                            // 获取当前活跃的工具块
+                            const currentToolId = assistantEl.dataset.currentToolId;
+                            let toolHint = currentToolId ? document.getElementById(currentToolId) : null;
+                            
+                            // 如果模型跳过了工具调用，直接移除当前工具提示
+                            if (toolData.status === "skipped") {
+                                if (toolHint) {
+                                    toolHint.remove();
+                                }
+                                delete assistantEl.dataset.currentToolId;
+                                scrollToBottom();
+                                continue;
+                            }
+                            
+                            if (!toolHint) {
+                                const toolId = `tool-${Date.now()}`;
+                                toolHint = document.createElement("div");
+                                toolHint.className = "tool-hint";
+                                toolHint.id = toolId;
+                                hintsEl.appendChild(toolHint);
+                            }
+                            console.log("[tool_end-2] toolHint元素:", toolHint);
+                            
+                            if (toolData.tools && toolData.tools.length > 0) {
+                                const toolCount = toolData.tools.length;
+                                
+                                // 判断是否包含 MCP 工具
+                                const hasMcpTool = toolData.tools.some(t => t.name && t.name.startsWith("mcp_"));
+                                const toolIcon = hasMcpTool ? "🔌" : "🛠️";
+                                
+                                const htmlContent = `
+                                    <details class="tool-details">
+                                        <summary><span class="tool-icon">${toolIcon}</span> <span class="tool-status">工具调用完成 (${toolCount}次)</span></summary>
+                                        <div class="tool-details-content">
+                                            ${toolData.tools.map((t, idx) => {
+                                                // 格式化 MCP 工具名称显示
+                                                let displayName = t.name;
+                                                if (t.name && t.name.startsWith("mcp_")) {
+                                                    const parts = t.name.split("_");
+                                                    if (parts.length >= 3) {
+                                                        displayName = "MCP:" + parts[1] + ":" + parts.slice(2).join("_");
+                                                    }
+                                                }
+                                                return '<div class="tool-call-item">' +
+                                                    '<div class="tool-call-name">' + (idx + 1) + '. ' + displayName + '</div>' +
+                                                    '<div class="tool-call-args">' + JSON.stringify(t.args, null, 2) + '</div>' +
+                                                    (t.result_preview ? '<div class="tool-call-result">结果: ' + t.result_preview + '</div>' : '') +
+                                                    (t.error ? '<div class="tool-call-error">错误: ' + t.error + '</div>' : '') +
+                                                '</div>';
+                                            }).join("")}
+                                        </div>
+                                    </details>
+                                `;
+                                
+                                console.log("[tool_end-2] 设置的HTML:", htmlContent.substring(0, 200));
+                                toolHint.innerHTML = htmlContent;
+                                toolHint.classList.add("completed");
+                            } else {
+                                // 没有工具调用，移除提示
+                                toolHint.remove();
+                            }
+                            
+                            // 清除当前活跃的工具块ID，以便下次创建新的
+                            delete assistantEl.dataset.currentToolId;
+                            
+                            scrollToBottom();
+                        }
+                    } catch (e) {
+                        console.error("[tool_end-2] 解析失败:", e);
+                    }
+                    continue;
+                }
+
+                // 处理视觉识别开始事件
+                if (eventName === "vision_start") {
+                    console.log("[SSE] 收到 vision_start 事件");
+                    try {
+                        const visionData = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            let visionHint = hintsEl.querySelector(".vision-hint");
+                            if (!visionHint) {
+                                visionHint = document.createElement("div");
+                                visionHint.className = "vision-hint";
+                                hintsEl.appendChild(visionHint);
+                            }
+                            const fileTypeMap = {
+                                "pdf": "PDF",
+                                "image": "图片",
+                                "document": "文档"
+                            };
+                            const fileTypeText = fileTypeMap[visionData.file_type] || "文件";
+                            const statusMessage = visionData.message || `${visionData.model} 正在识别${fileTypeText}...`;
+                            visionHint.innerHTML = `
+                                <details class="vision-details" open>
+                                    <summary><span class="vision-icon">👁️</span> <span class="vision-status">${statusMessage}</span></summary>
+                                    <div class="vision-content"></div>
+                                </details>
+                            `;
+                            scrollToBottom();
+                        }
+                    } catch (e) {
+                        console.error("解析视觉识别开始事件失败:", e);
+                    }
+                    continue;
+                }
+
+                // 处理视觉识别进度事件
+                if (eventName === "vision_progress") {
+                    console.log("[SSE] 收到 vision_progress 事件");
+                    try {
+                        const progressData = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            const visionStatus = hintsEl.querySelector(".vision-hint .vision-status");
+                            if (visionStatus && progressData.message) {
+                                const modelName = visionStatus.textContent.split(" ")[0];
+                                visionStatus.textContent = `${modelName} ${progressData.message}`;
+                            }
+                        }
+                    } catch (e) {}
+                    continue;
+                }
+
+                // 处理视觉识别内容块事件
+                if (eventName === "vision_chunk") {
+                    try {
+                        const chunkText = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            const visionContent = hintsEl.querySelector(".vision-hint .vision-content");
+                            if (visionContent && chunkText) {
+                                visionContent.innerHTML += chunkText.replace(/\n/g, '<br>');
+                                scrollToBottom();
+                            }
+                        }
+                    } catch (e) {}
+                    continue;
+                }
+
+                // 处理视觉识别结束事件
+                if (eventName === "vision_end") {
+                    console.log("[SSE] 收到 vision_end 事件");
+                    try {
+                        const visionData = JSON.parse(payload);
+                        const hintsEl = assistantEl?.querySelector(".message-hints");
+                        if (hintsEl) {
+                            let visionHint = hintsEl.querySelector(".vision-hint");
+                            if (visionHint) {
+                                const existingContent = visionHint.querySelector(".vision-content")?.innerHTML || "";
+                                const fileTypeMap = {
+                                    "pdf": "PDF",
+                                    "image": "图片",
+                                    "document": "文档"
+                                };
+                                const fileTypeText = fileTypeMap[visionData.file_type] || "文件";
+                                visionHint.innerHTML = `
+                                    <details class="vision-details">
+                                        <summary><span class="vision-icon">👁️</span> <span class="vision-status">${fileTypeText}识别完成</span></summary>
+                                        <div class="vision-content">${existingContent}</div>
+                                    </details>
+                                `;
+                                visionHint.classList.add("completed");
+                                scrollToBottom();
+                            }
+                        }
+                    } catch (e) {
+                        console.error("解析视觉识别结束事件失败:", e);
+                    }
+                    continue;
+                }
+                
                 // message 正文
                 // 忽略 user_message_id / message_id 等元数据
                 if (payload.includes("user_message_id") || payload.includes("message_id")) {
+                    continue;
+                }
+                
+                // 过滤掉深度思考和工具调用相关的 JSON（防止显示在正文中）
+                if (payload.includes('"status"') && (payload.includes('"thinking"') || payload.includes('"search_knowledge"') || payload.includes('"web_search"') || payload.includes('"done"'))) {
+                    console.log("[SSE] 过滤状态JSON:", payload.substring(0, 50));
+                    continue;
+                }
+                if (payload.includes('"tools"') && payload.includes('[')) {
+                    console.log("[SSE] 过滤工具结果JSON:", payload.substring(0, 50));
+                    continue;
+                }
+                if (payload.includes('"message"') && (payload.includes('正在') || payload.includes('深度思考') || payload.includes('查询') || payload.includes('搜索'))) {
+                    console.log("[SSE] 过滤消息JSON:", payload.substring(0, 50));
+                    continue;
+                }
+                if (payload.includes('"thinking"') && payload.includes(':')) {
+                    console.log("[SSE] 过滤思考内容JSON:", payload.substring(0, 50));
                     continue;
                 }
 
@@ -1950,13 +3781,16 @@ async function sendMessage() {
                 }
                 
                 if (parsedPayload) {
-                    // 流式处理：累积内容并实时渲染
+                    // 流式处理：累积内容到当前正文块
                     fullText += parsedPayload;
                     assistantEl.dataset.rawContent = fullText;
                     
-                    const contentEl = assistantEl.querySelector(".message-content");
-                    if (contentEl) {
-                        renderMarkdown(contentEl, fullText, false);
+                    // 获取或创建当前正文块
+                    const textBlock = getOrCreateTextBlock();
+                    if (textBlock) {
+                        textBlock.dataset.rawContent = (textBlock.dataset.rawContent || "") + parsedPayload;
+                        // 实时渲染（简单处理）
+                        renderMarkdown(textBlock, textBlock.dataset.rawContent, false);
                         scrollToBottom();
                     }
                 }
@@ -1964,15 +3798,40 @@ async function sendMessage() {
         }
         
         // 流式输出完成后，进行最终渲染
+        // 先结束当前正文块
+        finalizeCurrentTextBlock();
+        
         if (assistantEl) {
             assistantEl.dataset.rawContent = fullText;
-            const contentEl = assistantEl.querySelector(".message-content");
             
-            // 取消待处理的渲染，执行最终渲染
+            // 取消待处理的渲染
             if (window.MarkdownEngine && window.MarkdownEngine.cancelRender) {
-                window.MarkdownEngine.cancelRender(contentEl);
+                const textBlocks = assistantEl.querySelectorAll(".text-block");
+                textBlocks.forEach(block => {
+                    window.MarkdownEngine.cancelRender(block);
+                });
             }
             
+            // 最终渲染所有正文块
+            const textBlocks = assistantEl.querySelectorAll(".text-block");
+            textBlocks.forEach(block => {
+                const rawContent = block.dataset.rawContent || "";
+                if (rawContent) {
+                    renderMarkdown(block, rawContent, true);
+                }
+            });
+            
+            // 最终渲染所有思考内容块
+            const thinkingContents = assistantEl.querySelectorAll(".thinking-content");
+            thinkingContents.forEach(el => {
+                const rawContent = el.dataset.rawThinking || el.textContent;
+                if (rawContent && window.MarkdownEngine && window.MarkdownEngine.renderFinal) {
+                    window.MarkdownEngine.renderFinal(el, rawContent);
+                }
+            });
+            
+            // 最终渲染主内容区域
+            const contentEl = assistantEl.querySelector(".message-content");
             if (contentEl && fullText) {
                 renderMarkdown(contentEl, fullText, true);
             }
@@ -1994,9 +3853,10 @@ async function sendMessage() {
             if (contentEl) {
                 contentEl.innerHTML += "<br><span style='color:red;'>[请求异常] " + e.message + "</span>";
             }
-            if (assistantEl) {
-                addMessageFooter(assistantEl, fullText, null, false);
-            }
+        }
+        // 无论是否是 AbortError，都添加消息底部操作按钮
+        if (assistantEl && !assistantEl.querySelector(".message-footer")) {
+            addMessageFooter(assistantEl, fullText, null, false);
         }
     } finally {
         isStreaming = false;
@@ -2040,6 +3900,9 @@ async function selectConversation(id) {
         if (chatTitleEl) chatTitleEl.textContent = conv.title;
 
         await loadMessages(id);
+        
+        // 加载对话的已上传文件
+        await loadConversationFiles(id);
 
         if (conv.model && modelSelectEl) modelSelectEl.value = conv.model;
 
@@ -2050,7 +3913,8 @@ async function selectConversation(id) {
         }
 
         if (toggleKnowledgeEl) toggleKnowledgeEl.checked = !!conv.enable_knowledge_base;
-        if (toggleMcpEl) toggleMcpEl.checked = !!conv.enable_mcp;
+        // MCP 按钮状态根据是否有选中的服务来判断，而不是根据会话设置
+        updateMcpToggleState();
         if (toggleWebEl) toggleWebEl.checked = !!conv.enable_web_search;
 
         renderConversationList();
@@ -2072,7 +3936,12 @@ async function loadMessages(conversationId) {
         }
         const raw = await res.json();
         const msgs = normalizeApiResponse(raw) || [];
+        
         if (chatMessagesEl) chatMessagesEl.innerHTML = "";
+        
+        // 标记是否需要为第一条用户消息加载文件
+        let firstUserMsgEl = null;
+        
         msgs.forEach(msg => {
 
             // 使用数据库中保存的token信息
@@ -2098,15 +3967,70 @@ async function loadMessages(conversationId) {
                 }
             }
 
-            appendMessage(msg.role, msg.content, tokenInfo, true); // 显示底部信息
+            // 构建额外数据（工具调用、深度思考内容、视觉识别内容和消息事件流）
+            let extraData = null;
+            if (msg.role === "assistant" && (msg.tool_calls || msg.thinking_content || msg.vision_content || msg.message_events)) {
+                extraData = {
+                    tool_calls: msg.tool_calls,
+                    thinking_content: msg.thinking_content,
+                    vision_content: msg.vision_content,
+                    message_events: msg.message_events
+                };
+            }
+
+            const msgEl = appendMessage(msg.role, msg.content, tokenInfo, true, extraData);
+            
+            // 记录第一条用户消息元素，稍后异步加载文件
+            if (msg.role === "user" && !firstUserMsgEl) {
+                firstUserMsgEl = msgEl;
+            }
         });
 
         scrollToBottom();
+        
+        // 异步加载文件并更新第一条用户消息（不阻塞消息显示）
+        if (firstUserMsgEl) {
+            loadAndShowFilesForMessage(conversationId, firstUserMsgEl);
+        }
     } catch(e) { 
         console.error("加载消息失败:", e);
         if (chatMessagesEl) {
             chatMessagesEl.innerHTML = "<div style='color: #e74c3c; padding: 20px; text-align: center;'>加载消息失败，请重试</div>";
         }
+    }
+}
+
+// 异步加载对话文件并显示在消息中
+async function loadAndShowFilesForMessage(conversationId, msgEl) {
+    try {
+        const filesRes = await fetch(`${apiBase}/conversations/${conversationId}/files`);
+        if (!filesRes.ok) return;
+        
+        const files = await filesRes.json();
+        if (!files || files.length === 0) return;
+        
+        // 检查是否已经有文件显示
+        if (msgEl.querySelector('.user-message-files')) return;
+        
+        // 创建文件显示元素
+        const filesEl = document.createElement("div");
+        filesEl.className = "user-message-files";
+        files.forEach(file => {
+            const fileEl = document.createElement("span");
+            fileEl.className = "user-message-file";
+            fileEl.textContent = `📎 ${file.filename || '文件'}`;
+            filesEl.appendChild(fileEl);
+        });
+        
+        // 插入到编辑按钮之前
+        const actionsEl = msgEl.querySelector('.user-message-actions');
+        if (actionsEl) {
+            msgEl.insertBefore(filesEl, actionsEl);
+        } else {
+            msgEl.appendChild(filesEl);
+        }
+    } catch (e) {
+        console.warn("加载对话文件失败:", e);
     }
 }
 
@@ -2253,20 +4177,7 @@ function setupEventListeners() {
             closeModal("settings-modal");
             await loadKnowledgeBases();
             await loadEmbeddingModels();
-            await loadKnowledgeGraphStats();  // 加载知识图谱统计
             openModal("knowledge-modal");
-        });
-    }
-    
-    // 本地 RAG MCP 链接点击事件
-    const setupLocalRagLink = document.getElementById("setup-local-rag-link");
-    if (setupLocalRagLink) {
-        setupLocalRagLink.addEventListener("click", (e) => {
-            e.preventDefault();
-            const localRagInfo = document.getElementById("local-rag-info");
-            if (localRagInfo) {
-                localRagInfo.style.display = localRagInfo.style.display === "none" ? "block" : "none";
-            }
         });
     }
 
@@ -2359,6 +4270,9 @@ function setupEventListeners() {
                     console.error("保存模型设置失败:", e);
                 }
             }
+            
+            // 更新视觉识别开关的显示状态
+            updateVisionToggleVisibility();
         });
     }
     
@@ -2463,36 +4377,59 @@ function updateMcpPopupOptions() {
     const toggleMcp = document.getElementById('toggle-mcp');
     if (!optionsContainer) return;
     
+    console.log('[MCP] 更新弹出框选项, mcpServers:', mcpServers);
+    
     optionsContainer.innerHTML = '';
     
-    // 过滤启用的 MCP 服务器
-    const enabledServers = mcpServers.filter(s => s.is_enabled);
+    // 显示所有已启用的 MCP 服务器（不管是否运行中）
+    const availableServers = mcpServers.filter(s => s.enabled !== false);
     
-    if (enabledServers.length === 0) {
+    console.log('[MCP] 可用服务器:', availableServers);
+    
+    if (availableServers.length === 0) {
         optionsContainer.innerHTML = '<div class="toggle-popup-empty">暂无可用的 MCP 服务</div>';
         // 没有可用服务时，关闭按钮
         if (toggleMcp) toggleMcp.checked = false;
         return;
     }
     
-    enabledServers.forEach(server => {
+    availableServers.forEach(server => {
         const option = document.createElement('label');
         option.className = 'toggle-popup-option';
+        
+        // 显示运行状态
+        const statusIcon = server.running ? '🟢' : '⚪';
+        const toolsInfo = server.running && server.tools ? `${server.tools.length}个工具` : '未启动';
+        
         option.innerHTML = `
-            <input type="checkbox" value="${server.id}" ${server.selected ? 'checked' : ''}>
-            <span>${server.name}</span>
+            <input type="checkbox" value="${server.name}" ${server.selected ? 'checked' : ''}>
+            <span>${statusIcon} ${server.name}</span>
+            <small style="color: var(--text-muted); margin-left: 8px;">${toolsInfo}</small>
         `;
         
         const checkbox = option.querySelector('input');
-        checkbox.addEventListener('change', () => {
+        checkbox.addEventListener('change', async () => {
             // 更新服务器选中状态
             server.selected = checkbox.checked;
             
+            // 先保存工具设置（确保状态被保存）
+            saveToolSettings();
+            
+            if (checkbox.checked) {
+                // 勾选时启动服务器（如果未运行）
+                if (!server.running) {
+                    // 显示启动中状态
+                    const small = option.querySelector('small');
+                    if (small) small.textContent = '启动中...';
+                    
+                    await startMcpServerIfNeeded(server.name);
+                    // startMcpServerIfNeeded 内部会调用 loadMCPServers -> updateMcpPopupOptions
+                    // 所以这里不需要再调用 updateMcpPopupOptions
+                }
+            }
+            
             // 根据是否有任何选中项来更新主 toggle 状态
             updateMcpToggleState();
-            
-            // 保存工具设置
-            saveToolSettings();
         });
         
         optionsContainer.appendChild(option);
@@ -2507,8 +4444,8 @@ function updateMcpToggleState() {
     const toggleMcp = document.getElementById('toggle-mcp');
     if (!toggleMcp) return;
     
-    const enabledServers = mcpServers.filter(s => s.is_enabled);
-    const anySelected = enabledServers.some(s => s.selected);
+    // 检查是否有任何选中的服务器
+    const anySelected = mcpServers.some(s => s.selected);
     toggleMcp.checked = anySelected;
 }
 
@@ -2520,16 +4457,12 @@ function initImageGenTogglePopup() {
     const checkbox = document.getElementById('toggle-image-gen');
     const popup = document.getElementById('image-gen-popup');
     
-    console.log('[ImageGen] 初始化弹窗:', { wrapper: !!wrapper, checkbox: !!checkbox, popup: !!popup });
-    
     if (!wrapper || !checkbox || !popup) {
-        console.warn('[ImageGen] 弹窗元素未找到');
         return;
     }
     
     const label = wrapper.querySelector('label');
     if (!label) {
-        console.warn('[ImageGen] label 元素未找到');
         return;
     }
     
@@ -2537,8 +4470,6 @@ function initImageGenTogglePopup() {
     label.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
-        
-        console.log('[ImageGen] label 被点击');
         
         // 关闭其他弹窗
         document.querySelectorAll('.toggle-with-popup.open').forEach(el => {
@@ -2552,61 +4483,27 @@ function initImageGenTogglePopup() {
         } else {
             wrapper.classList.add('open');
             updateTogglePopupPosition(wrapper, popup);
-            loadImageGenModels();
         }
     });
 }
 
-// 加载生图模型列表
-async function loadImageGenModels() {
-    const select = document.getElementById('image-gen-model-select');
-    if (!select) return;
-    
-    try {
-        const res = await fetch(`${apiBase}/models/image-gen`);
-        if (!res.ok) return;
-        const data = await res.json();
-        
-        select.innerHTML = '';
-        
-        if (!data.models || data.models.length === 0) {
-            select.innerHTML = '<option value="">请先配置生图模型</option>';
-            return;
-        }
-        
-        data.models.forEach(m => {
-            const opt = document.createElement('option');
-            opt.value = JSON.stringify({ model: m.model, provider_id: m.provider_id });
-            opt.textContent = m.custom_name || m.model;
-            if (m.provider_name) {
-                opt.textContent += ` (${m.provider_name})`;
-            }
-            select.appendChild(opt);
-        });
-    } catch (e) {
-        console.error('加载生图模型失败:', e);
-    }
-}
-
 // 发送生图请求
 async function sendImageGenRequest(prompt) {
-    const modelSelect = document.getElementById('image-gen-model-select');
-    const sizeSelect = document.getElementById('image-gen-size-select');
+    // 使用当前选择的模型
+    const selectedModel = modelSelectEl ? modelSelectEl.value : '';
+    const selectedProviderId = providerSelectEl ? providerSelectEl.value : '';
     
-    if (!modelSelect || !modelSelect.value) {
+    if (!selectedModel) {
         alert('请先选择生图模型');
         return null;
     }
     
-    let modelInfo;
-    try {
-        modelInfo = JSON.parse(modelSelect.value);
-    } catch (e) {
-        alert('生图模型配置错误');
-        return null;
-    }
-    
-    const size = sizeSelect?.value || '1024x1024';
+    // 获取尺寸输入框的值
+    const widthInput = document.getElementById('image-gen-width');
+    const heightInput = document.getElementById('image-gen-height');
+    const width = widthInput?.value || '1024';
+    const height = heightInput?.value || '1024';
+    const size = `${width}x${height}`;
     
     // 显示生成中的消息
     appendMessage('user', `[生图] ${prompt}`);
@@ -2615,10 +4512,12 @@ async function sendImageGenRequest(prompt) {
     try {
         const formData = new FormData();
         formData.append('prompt', prompt);
-        formData.append('model', modelInfo.model);
+        formData.append('model', selectedModel);
         formData.append('size', size);
         formData.append('n', '1');
-        formData.append('provider_id', modelInfo.provider_id);
+        if (selectedProviderId) {
+            formData.append('provider_id', selectedProviderId);
+        }
         if (currentConversationId) {
             formData.append('conversation_id', currentConversationId);
         }
@@ -2632,7 +4531,7 @@ async function sendImageGenRequest(prompt) {
         
         if (result.success && result.images && result.images.length > 0) {
             // 构建图片显示内容
-            let content = `**生成完成** (模型: ${modelInfo.model}, 尺寸: ${size})\n\n`;
+            let content = `**生成完成** (模型: ${selectedModel}, 尺寸: ${size})\n\n`;
             result.images.forEach((img, i) => {
                 if (img.url) {
                     content += `![生成的图片 ${i + 1}](${img.url})\n\n`;
@@ -2691,6 +4590,16 @@ function setupSettingsEventListeners() {
         });
     }
     
+    // 默认对话模型选择器
+    const defaultChatModelSelect = document.getElementById("default-chat-model-select");
+    if (defaultChatModelSelect) {
+        defaultChatModelSelect.addEventListener("change", async (e) => {
+            const defaultChatModel = e.target.value;
+            currentSettings.default_chat_model = defaultChatModel;
+            await saveSettingItem("default_chat_model", defaultChatModel);
+        });
+    }
+    
     const autoTitleModelSelect = document.getElementById("auto-title-model-select");
     if (autoTitleModelSelect) {
         autoTitleModelSelect.addEventListener("change", async (e) => {
@@ -2700,13 +4609,13 @@ function setupSettingsEventListeners() {
         });
     }
     
-    // OCR方法选择器
-    const ocrMethodSelect = document.getElementById("ocr-method-select");
-    if (ocrMethodSelect) {
-        ocrMethodSelect.addEventListener("change", async (e) => {
-            const ocrMethod = e.target.value;
-            currentSettings.ocr_method = ocrMethod;
-            await saveSettingItem("ocr_method", ocrMethod);
+    // 默认视觉模型选择器
+    const defaultVisionModelSelect = document.getElementById("default-vision-model-select");
+    if (defaultVisionModelSelect) {
+        defaultVisionModelSelect.addEventListener("change", async (e) => {
+            const defaultVisionModel = e.target.value;
+            currentSettings.default_vision_model = defaultVisionModel;
+            await saveSettingItem("default_vision_model", defaultVisionModel);
         });
     }
 }
@@ -2757,8 +4666,12 @@ async function init() {
         initMCPInputs();
         loadToolSettings();
         setupToolSettingsListeners();
+        initThinkingToggle();
         setupEventListeners();
         setupSettingsEventListeners();
+        
+        // 初始化文件上传功能
+        initFileUpload();
         
         // 自动选择或创建对话
         await autoSelectOrCreateConversation();
@@ -2810,9 +4723,45 @@ async function createNewConversation() {
         await loadConversations();
         if (conv && conv.id) {
             await selectConversation(conv.id);
+            // 新对话创建后，恢复模型选择
+            restoreModelSelection();
         }
     } catch(e) {
         console.error("创建对话失败:", e);
+    }
+}
+
+// 恢复模型选择（新对话时调用）
+function restoreModelSelection() {
+    const defaultChatModel = currentSettings.default_chat_model || "remember_last";
+    
+    let targetModel = "";
+    let targetDisplayText = "";
+    
+    if (defaultChatModel === "remember_last") {
+        // 使用上次选择的模型
+        targetModel = localStorage.getItem("last_selected_model") || "";
+        targetDisplayText = localStorage.getItem("last_selected_model_display") || targetModel;
+        console.log("[模型恢复] 使用上次选择的模型:", targetModel);
+    } else if (defaultChatModel) {
+        // 使用设置的默认模型
+        targetModel = defaultChatModel;
+        targetDisplayText = defaultChatModel;
+        console.log("[模型恢复] 使用默认对话模型:", targetModel);
+    }
+    
+    if (targetModel) {
+        // 检查模型是否存在于当前可用模型列表中
+        const dropdown = document.getElementById("model-select-dropdown");
+        const option = dropdown?.querySelector(`.custom-select-option[data-value="${targetModel}"]`);
+        
+        if (option) {
+            // 模型存在，选择它
+            const displayText = option.querySelector(".option-name")?.textContent || targetDisplayText;
+            selectModelOption(targetModel, displayText);
+        } else {
+            console.log("[模型恢复] 目标模型不在可用列表中:", targetModel);
+        }
     }
 }
 
@@ -3029,6 +4978,9 @@ function createEnvInputGroup(key = "", value = "") {
 
 // ========== 知识库管理功能 ==========
 
+// 当前选中的知识库ID
+let selectedKbId = null;
+
 // 渲染知识库列表
 function renderKnowledgeBaseList() {
     if (!kbListEl) return;
@@ -3036,54 +4988,149 @@ function renderKnowledgeBaseList() {
     kbListEl.innerHTML = "";
     
     if (knowledgeBases.length === 0) {
-        kbListEl.innerHTML = '<div class="empty-list">暂无知识库</div>';
+        kbListEl.innerHTML = '<div class="empty-list">暂无知识库，请先创建</div>';
+        selectedKbId = null;
+        onKbSelectChange();
         return;
     }
     
     knowledgeBases.forEach(kb => {
         const item = document.createElement("div");
-        item.className = "kb-item";
+        item.className = "kb-item" + (selectedKbId == kb.id ? " selected" : "");
+        item.dataset.kbId = kb.id;
         item.innerHTML = `
             <div class="kb-info">
                 <div class="kb-name">${kb.name}</div>
                 <div class="kb-desc">${kb.description || '无描述'}</div>
             </div>
             <div class="kb-actions">
-                <button class="delete-kb-btn" data-id="${kb.id}">🗑️ 删除</button>
+                <button type="button" class="delete-kb-btn" data-id="${kb.id}">🗑️ 删除</button>
             </div>
         `;
         kbListEl.appendChild(item);
+        
+        // 点击选中知识库
+        item.querySelector(".kb-info").addEventListener("click", () => {
+            selectKnowledgeBase(kb.id);
+        });
     });
     
     // 添加删除按钮事件
     kbListEl.querySelectorAll(".delete-kb-btn").forEach(btn => {
-        btn.addEventListener("click", async () => {
+        btn.addEventListener("click", async (e) => {
+            e.stopPropagation();
             const kbId = btn.getAttribute("data-id");
             try {
                 const res = await fetch(`${apiBase}/knowledge/bases/${kbId}`, { method: "DELETE" });
                 if (!res.ok) throw new Error("删除失败");
+                // 如果删除的是当前选中的，清空选中
+                if (selectedKbId == kbId) {
+                    selectedKbId = null;
+                }
                 await loadKnowledgeBases();
                 renderKnowledgeBaseList();
-                updateKnowledgeBaseSelect();
             } catch (e) {
                 console.error("删除知识库失败:", e);
             }
         });
     });
+    
+    // 如果有知识库但没有选中，自动选中第一个
+    if (knowledgeBases.length > 0 && !selectedKbId) {
+        selectKnowledgeBase(knowledgeBases[0].id);
+    }
 }
 
-// 更新知识库选择器
-function updateKnowledgeBaseSelect() {
-    if (!kbSelectEl) return;
+// 选中知识库
+function selectKnowledgeBase(kbId) {
+    selectedKbId = kbId;
     
-    kbSelectEl.innerHTML = '<option value="">选择知识库</option>';
-    knowledgeBases.forEach(kb => {
-        const opt = document.createElement("option");
-        opt.value = kb.id;
-        opt.textContent = kb.name;
-        kbSelectEl.appendChild(opt);
-    });
-    refreshCustomSelect(kbSelectEl);
+    // 更新选中样式
+    if (kbListEl) {
+        kbListEl.querySelectorAll(".kb-item").forEach(item => {
+            item.classList.toggle("selected", item.dataset.kbId == kbId);
+        });
+    }
+    
+    // 加载已有文件列表
+    onKbSelectChange();
+}
+
+// 更新知识库选择器（保留兼容性，但不再使用下拉框）
+function updateKnowledgeBaseSelect() {
+    // 不再需要下拉框，直接触发文件列表刷新
+    onKbSelectChange();
+}
+
+// 知识库选择变化时加载已有文件
+async function onKbSelectChange() {
+    const kbId = selectedKbId;
+    const existingFilesEl = document.getElementById("kb-existing-files");
+    
+    if (!existingFilesEl) return;
+    
+    if (!kbId) {
+        existingFilesEl.style.display = "none";
+        return;
+    }
+    
+    try {
+        const res = await fetch(`${apiBase}/knowledge/documents?kb_id=${kbId}`);
+        if (!res.ok) throw new Error("加载失败");
+        
+        const docs = await res.json();
+        
+        if (docs.length === 0) {
+            existingFilesEl.innerHTML = '<div class="kb-existing-empty">该知识库暂无文件</div>';
+        } else {
+            let html = `<div class="kb-existing-title">📁 已有 ${docs.length} 个文件：</div><div class="kb-existing-list">`;
+            docs.forEach(doc => {
+                const ext = doc.file_name.split('.').pop().toLowerCase();
+                const icons = {
+                    'pdf': '📄', 'docx': '📝', 'doc': '📝', 
+                    'pptx': '📊', 'xlsx': '📈', 'xls': '📈',
+                    'txt': '📃', 'md': '📃', 'csv': '📃',
+                    'json': '📋', 'xml': '📋', 'html': '🌐', 'htm': '🌐',
+                    'png': '🖼️', 'jpg': '🖼️', 'jpeg': '🖼️', 'gif': '🖼️', 'bmp': '🖼️', 'webp': '🖼️'
+                };
+                const icon = icons[ext] || '📄';
+                const date = doc.created_at ? new Date(doc.created_at).toLocaleDateString() : '';
+                html += `<div class="kb-existing-item" data-doc-id="${doc.id}"><span class="file-icon">${icon}</span><span class="file-name">${doc.file_name}</span><span class="file-date">${date}</span><button type="button" class="kb-doc-delete-btn" title="删除">×</button></div>`;
+            });
+            html += '</div>';
+            existingFilesEl.innerHTML = html;
+            
+            // 绑定删除按钮事件
+            existingFilesEl.querySelectorAll('.kb-doc-delete-btn').forEach(btn => {
+                btn.addEventListener('click', async (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const item = btn.closest('.kb-existing-item');
+                    const docId = item.dataset.docId;
+                    
+                    try {
+                        const res = await fetch(`${apiBase}/knowledge/documents/${docId}`, { method: 'DELETE' });
+                        if (!res.ok) throw new Error("删除失败");
+                        item.remove(); // 直接移除DOM元素
+                        // 更新标题数量
+                        const remaining = existingFilesEl.querySelectorAll('.kb-existing-item').length;
+                        const titleEl = existingFilesEl.querySelector('.kb-existing-title');
+                        if (remaining === 0) {
+                            existingFilesEl.innerHTML = '<div class="kb-existing-empty">该知识库暂无文件</div>';
+                        } else if (titleEl) {
+                            titleEl.textContent = `📁 已有 ${remaining} 个文件：`;
+                        }
+                    } catch (e) {
+                        alert("删除失败: " + e.message);
+                    }
+                });
+            });
+        }
+        existingFilesEl.style.display = "block";
+    } catch (e) {
+        console.error("加载知识库文件列表失败:", e);
+        existingFilesEl.style.display = "none";
+    }
 }
 
 // 初始化知识库表单事件
@@ -3125,31 +5172,116 @@ function initKnowledgeBaseForms() {
     
     // 上传文档表单
     if (kbUploadFormEl) {
+        // 文件选择变化时显示已选文件列表
+        const fileInput = document.getElementById("kb-file");
+        const fileListEl = document.getElementById("kb-file-list");
+        
+        if (fileInput && fileListEl) {
+            // 存储待上传文件列表（用于支持删除）
+            let pendingFiles = [];
+            
+            fileInput.addEventListener("change", () => {
+                const files = fileInput.files;
+                if (files && files.length > 0) {
+                    // 合并新选择的文件到待上传列表
+                    pendingFiles = Array.from(files);
+                    renderPendingFiles();
+                } else {
+                    pendingFiles = [];
+                    fileListEl.style.display = "none";
+                }
+            });
+            
+            // 渲染待上传文件列表
+            function renderPendingFiles() {
+                if (pendingFiles.length === 0) {
+                    fileListEl.style.display = "none";
+                    return;
+                }
+                
+                let html = `<div class="kb-file-list-title">已选择 ${pendingFiles.length} 个文件：</div>`;
+                pendingFiles.forEach((file, index) => {
+                    const size = file.size < 1024 * 1024 
+                        ? (file.size / 1024).toFixed(1) + ' KB'
+                        : (file.size / 1024 / 1024).toFixed(1) + ' MB';
+                    const ext = file.name.split('.').pop().toLowerCase();
+                    const icons = {
+                        'pdf': '📄', 'docx': '📝', 'doc': '📝', 
+                        'pptx': '📊', 'xlsx': '📈', 'xls': '📈',
+                        'txt': '📃', 'md': '📃', 'csv': '📃',
+                        'json': '📋', 'xml': '📋', 'html': '🌐', 'htm': '🌐',
+                        'png': '🖼️', 'jpg': '🖼️', 'jpeg': '🖼️', 'gif': '🖼️', 'bmp': '🖼️', 'webp': '🖼️'
+                    };
+                    const icon = icons[ext] || '📄';
+                    html += `<div class="kb-file-item">
+                        <span class="file-icon">${icon}</span>
+                        <span class="file-name">${file.name}</span>
+                        <span class="file-size">${size}</span>
+                        <button type="button" class="kb-pending-delete-btn" data-index="${index}" title="移除">×</button>
+                    </div>`;
+                });
+                fileListEl.innerHTML = html;
+                fileListEl.style.display = "block";
+                
+                // 绑定删除按钮事件
+                fileListEl.querySelectorAll(".kb-pending-delete-btn").forEach(btn => {
+                    btn.addEventListener("click", (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        const index = parseInt(btn.dataset.index);
+                        pendingFiles.splice(index, 1);
+                        renderPendingFiles();
+                        // 清空原始 input（因为无法直接修改 FileList）
+                        fileInput.value = "";
+                    });
+                });
+            }
+            
+            // 暴露 pendingFiles 供上传使用
+            window._kbPendingFiles = () => pendingFiles;
+            window._kbClearPendingFiles = () => { pendingFiles = []; renderPendingFiles(); };
+        }
+        
         kbUploadFormEl.addEventListener("submit", async (e) => {
             e.preventDefault();
             
-            const kbId = kbSelectEl ? kbSelectEl.value : "";
+            const kbId = selectedKbId;
             const embeddingModel = embeddingModelSelectEl ? embeddingModelSelectEl.value : "";
             const fileInput = document.getElementById("kb-file");
-            const extractGraph = document.getElementById("kb-extract-graph")?.checked ?? true;
+            const extractImages = document.getElementById("kb-extract-images")?.checked ?? false;
+            const visionModel = document.getElementById("kb-vision-model-select")?.value || "";
+            const uploadBtn = document.getElementById("kb-upload-btn");
             
             if (!kbId) {
                 alert("请选择目标知识库");
                 return;
             }
             
-            if (!fileInput || !fileInput.files || fileInput.files.length === 0) {
+            // 优先使用 pendingFiles，否则使用 fileInput.files
+            const pendingFiles = window._kbPendingFiles ? window._kbPendingFiles() : [];
+            const files = pendingFiles.length > 0 ? pendingFiles : (fileInput && fileInput.files ? Array.from(fileInput.files) : []);
+            
+            if (files.length === 0) {
                 alert("请选择要上传的文件");
                 return;
             }
             
-            const files = Array.from(fileInput.files);
+            // 如果启用了图片提取但没有配置视觉模型，提示用户
+            if (extractImages && !visionModel) {
+                alert("启用图片提取需要先配置图片识别方案（视觉模型）");
+                return;
+            }
+            
             const totalFiles = files.length;
             let successCount = 0;
             let failCount = 0;
             let totalChunks = 0;
-            let totalEntities = 0;
-            let totalRelations = 0;
+            
+            // 禁用按钮防止重复点击
+            if (uploadBtn) {
+                uploadBtn.disabled = true;
+                uploadBtn.textContent = "上传中...";
+            }
             
             if (kbUploadStatusEl) {
                 kbUploadStatusEl.textContent = `上传中... (0/${totalFiles})`;
@@ -3162,11 +5294,13 @@ function initKnowledgeBaseForms() {
                 const formData = new FormData();
                 formData.append("kb_id", kbId);
                 formData.append("file", file);
-                formData.append("extract_graph", extractGraph ? "true" : "false");
+                formData.append("extract_images", extractImages ? "true" : "false");
                 if (embeddingModel) formData.append("embedding_model", embeddingModel);
+                if (visionModel) formData.append("vision_model", visionModel);
                 
                 if (kbUploadStatusEl) {
-                    kbUploadStatusEl.textContent = `上传中... (${i + 1}/${totalFiles}) - ${file.name}`;
+                    const statusText = extractImages ? `上传并识别图片中... (${i + 1}/${totalFiles}) - ${file.name}` : `上传中... (${i + 1}/${totalFiles}) - ${file.name}`;
+                    kbUploadStatusEl.textContent = statusText;
                 }
                 
                 try {
@@ -3183,10 +5317,6 @@ function initKnowledgeBaseForms() {
                     if (result.chunks_count > 0) {
                         totalChunks += result.chunks_count;
                     }
-                    if (result.graph) {
-                        totalEntities += result.graph.entities_created || 0;
-                        totalRelations += result.graph.relations_created || 0;
-                    }
                 } catch (e) {
                     failCount++;
                     console.error(`上传文件 ${file.name} 失败:`, e);
@@ -3201,337 +5331,31 @@ function initKnowledgeBaseForms() {
             if (totalChunks > 0) {
                 statusMsg += `，共创建 ${totalChunks} 个向量块`;
             }
-            if (totalEntities > 0 || totalRelations > 0) {
-                statusMsg += `，提取了 ${totalEntities} 个实体和 ${totalRelations} 个关系`;
-            }
             
             if (kbUploadStatusEl) {
                 kbUploadStatusEl.textContent = statusMsg;
             }
             kbUploadFormEl.reset();
             
-            // 刷新知识图谱统计
-            loadKnowledgeGraphStats(kbId);
+            // 清空待上传文件列表
+            if (window._kbClearPendingFiles) window._kbClearPendingFiles();
+            
+            // 隐藏文件列表
+            const fileListEl = document.getElementById("kb-file-list");
+            if (fileListEl) fileListEl.style.display = "none";
+            
+            // 恢复按钮状态
+            if (uploadBtn) {
+                uploadBtn.disabled = false;
+                uploadBtn.textContent = "上传并构建知识库";
+            }
+            
+            // 刷新已有文件列表
+            onKbSelectChange();
             
             setTimeout(() => {
                 if (kbUploadStatusEl) kbUploadStatusEl.style.display = "none";
             }, 5000);
-        });
-    }
-}
-
-// 加载知识图谱统计
-async function loadKnowledgeGraphStats(kbId) {
-    try {
-        const url = kbId ? `${apiBase}/knowledge/graph/stats?kb_id=${kbId}` : `${apiBase}/knowledge/graph/stats`;
-        const res = await fetch(url);
-        if (!res.ok) return;
-        
-        const stats = await res.json();
-        const statsEl = document.getElementById("kb-graph-stats");
-        const contentEl = document.getElementById("kb-graph-stats-content");
-        
-        if (statsEl && contentEl) {
-            if (stats.entity_count > 0 || stats.relation_count > 0) {
-                let html = `<div>实体数量: <strong>${stats.entity_count}</strong> | 关系数量: <strong>${stats.relation_count}</strong></div>`;
-                
-                if (stats.entity_types && Object.keys(stats.entity_types).length > 0) {
-                    html += '<div style="margin-top: 6px;">实体类型: ';
-                    const types = Object.entries(stats.entity_types)
-                        .map(([type, count]) => `${type}(${count})`)
-                        .join(', ');
-                    html += types + '</div>';
-                }
-                
-                contentEl.innerHTML = html;
-                statsEl.style.display = "block";
-            } else {
-                statsEl.style.display = "none";
-            }
-        }
-    } catch (e) {
-        console.error("加载知识图谱统计失败:", e);
-    }
-}
-
-// ========== MCP服务器管理功能 ==========
-
-// 渲染MCP服务器列表
-function renderMCPServerList() {
-    if (!mcpListEl) return;
-    
-    mcpListEl.innerHTML = "";
-    
-    if (mcpServers.length === 0) {
-        mcpListEl.innerHTML = '<div class="empty-list">暂无MCP服务器</div>';
-        return;
-    }
-    
-    mcpServers.forEach(server => {
-        const item = document.createElement("div");
-        item.className = "mcp-item";
-        const statusIcon = server.is_enabled ? "🟢" : "🔴";
-        item.innerHTML = `
-            <div class="mcp-info">
-                <div class="mcp-name">${statusIcon} ${server.name}</div>
-                <div class="mcp-desc">${server.description || server.connection_type}</div>
-            </div>
-            <div class="mcp-actions">
-                <button class="edit-mcp-btn" data-id="${server.id}">✏️ 编辑</button>
-                <button class="test-mcp-btn" data-id="${server.id}">🔗 测试</button>
-                <button class="delete-mcp-btn" data-id="${server.id}">🗑️ 删除</button>
-            </div>
-        `;
-        mcpListEl.appendChild(item);
-    });
-    
-    // 添加编辑按钮事件
-    mcpListEl.querySelectorAll(".edit-mcp-btn").forEach(btn => {
-        btn.addEventListener("click", () => {
-            const serverId = btn.getAttribute("data-id");
-            const server = mcpServers.find(s => s.id == serverId);
-            if (server) {
-                fillMCPForm(server);
-            }
-        });
-    });
-    
-    // 添加测试按钮事件
-    mcpListEl.querySelectorAll(".test-mcp-btn").forEach(btn => {
-        btn.addEventListener("click", async () => {
-            const serverId = btn.getAttribute("data-id");
-            btn.textContent = "测试中...";
-            btn.disabled = true;
-            
-            try {
-                const res = await fetch(`${apiBase}/mcp/servers/${serverId}/test`, { method: "POST" });
-                const result = await res.json();
-                
-                if (result.success) {
-                    btn.textContent = "✓ 连接成功";
-                } else {
-                    btn.textContent = "✗ 连接失败";
-                    alert("连接失败: " + (result.error || "未知错误"));
-                }
-            } catch (e) {
-                btn.textContent = "✗ 测试失败";
-                alert("测试失败: " + e.message);
-            }
-            
-            setTimeout(() => {
-                btn.textContent = "🔗 测试";
-                btn.disabled = false;
-            }, 2000);
-        });
-    });
-    
-    // 添加删除按钮事件
-    mcpListEl.querySelectorAll(".delete-mcp-btn").forEach(btn => {
-        btn.addEventListener("click", async () => {
-            const serverId = btn.getAttribute("data-id");
-            try {
-                const res = await fetch(`${apiBase}/mcp/servers/${serverId}`, { method: "DELETE" });
-                if (!res.ok) throw new Error("删除失败");
-                await loadMCPServers();
-                renderMCPServerList();
-            } catch (e) {
-                console.error("删除MCP服务器失败:", e);
-            }
-        });
-    });
-}
-
-// 填充MCP表单
-function fillMCPForm(server) {
-    document.getElementById("mcp-id").value = server.id;
-    document.getElementById("mcp-name").value = server.name;
-    document.getElementById("mcp-description").value = server.description || "";
-    document.getElementById("mcp-connection-type").value = server.connection_type;
-    document.getElementById("mcp-is-enabled").checked = server.is_enabled;
-    
-    // 触发连接类型变化
-    const connectionTypeEl = document.getElementById("mcp-connection-type");
-    const stdioConfigEl = document.getElementById("mcp-stdio-config");
-    const httpConfigEl = document.getElementById("mcp-http-config");
-    
-    if (server.connection_type === "stdio") {
-        stdioConfigEl.style.display = "block";
-        httpConfigEl.style.display = "none";
-        document.getElementById("mcp-command").value = server.command || "";
-        
-        // 填充参数
-        const argsContainer = document.getElementById("mcp-args-container");
-        argsContainer.innerHTML = "";
-        const args = server.args || [];
-        args.forEach(arg => {
-            const group = createArgInputGroup(arg);
-            argsContainer.appendChild(group);
-        });
-        // 添加一个空的输入组
-        const emptyGroup = document.createElement("div");
-        emptyGroup.className = "args-input-group";
-        emptyGroup.innerHTML = `
-            <input type="text" class="arg-input" placeholder="输入参数，如 -y">
-            <button type="button" class="add-arg-btn">+</button>
-        `;
-        argsContainer.appendChild(emptyGroup);
-        emptyGroup.querySelector(".add-arg-btn").addEventListener("click", () => {
-            const newGroup = createArgInputGroup();
-            argsContainer.insertBefore(newGroup, emptyGroup);
-        });
-    } else if (server.connection_type === "http") {
-        stdioConfigEl.style.display = "none";
-        httpConfigEl.style.display = "block";
-        document.getElementById("mcp-url").value = server.url || "";
-    }
-    
-    // 填充环境变量
-    const envContainer = document.getElementById("mcp-env-container");
-    envContainer.innerHTML = "";
-    const env = server.env || {};
-    Object.entries(env).forEach(([key, value]) => {
-        const group = createEnvInputGroup(key, value);
-        envContainer.appendChild(group);
-    });
-    // 添加一个空的输入组
-    const emptyEnvGroup = document.createElement("div");
-    emptyEnvGroup.className = "env-input-group";
-    emptyEnvGroup.innerHTML = `
-        <input type="text" class="env-key-input" placeholder="变量名">
-        <input type="text" class="env-value-input" placeholder="变量值">
-        <button type="button" class="add-env-btn">+</button>
-    `;
-    envContainer.appendChild(emptyEnvGroup);
-    emptyEnvGroup.querySelector(".add-env-btn").addEventListener("click", () => {
-        const newGroup = createEnvInputGroup();
-        envContainer.insertBefore(newGroup, emptyEnvGroup);
-    });
-}
-
-// 初始化MCP表单事件
-function initMCPForms() {
-    if (mcpFormEl) {
-        mcpFormEl.addEventListener("submit", async (e) => {
-            e.preventDefault();
-            
-            const id = document.getElementById("mcp-id").value;
-            const name = document.getElementById("mcp-name").value.trim();
-            const description = document.getElementById("mcp-description").value.trim();
-            const connectionType = document.getElementById("mcp-connection-type").value;
-            const isEnabled = document.getElementById("mcp-is-enabled").checked;
-            
-            if (!name) {
-                alert("请输入服务器名称");
-                return;
-            }
-            
-            if (!connectionType) {
-                alert("请选择连接类型");
-                return;
-            }
-            
-            const formData = new FormData();
-            formData.append("name", name);
-            if (description) formData.append("description", description);
-            formData.append("connection_type", connectionType);
-            formData.append("is_enabled", isEnabled ? "true" : "false");
-            
-            if (connectionType === "stdio") {
-                const command = document.getElementById("mcp-command").value.trim();
-                if (!command) {
-                    alert("请输入命令");
-                    return;
-                }
-                formData.append("command", command);
-                
-                // 收集参数
-                const args = [];
-                document.querySelectorAll("#mcp-args-container .arg-input").forEach(input => {
-                    if (input.value.trim()) {
-                        args.push(input.value.trim());
-                    }
-                });
-                formData.append("args", JSON.stringify(args));
-            } else if (connectionType === "http") {
-                const url = document.getElementById("mcp-url").value.trim();
-                if (!url) {
-                    alert("请输入服务URL");
-                    return;
-                }
-                formData.append("url", url);
-            }
-            
-            // 收集环境变量
-            const env = {};
-            document.querySelectorAll("#mcp-env-container .env-input-group").forEach(group => {
-                const keyInput = group.querySelector(".env-key-input");
-                const valueInput = group.querySelector(".env-value-input");
-                if (keyInput && valueInput && keyInput.value.trim()) {
-                    env[keyInput.value.trim()] = valueInput.value;
-                }
-            });
-            formData.append("env", JSON.stringify(env));
-            
-            try {
-                const url = id ? `${apiBase}/mcp/servers/${id}` : `${apiBase}/mcp/servers`;
-                const method = "POST";
-                const res = await fetch(url, { method, body: formData });
-                if (!res.ok) throw new Error(await res.text());
-                
-                await loadMCPServers();
-                renderMCPServerList();
-                mcpFormEl.reset();
-                document.getElementById("mcp-id").value = "";
-                document.getElementById("mcp-stdio-config").style.display = "none";
-                document.getElementById("mcp-http-config").style.display = "none";
-                alert(id ? "MCP服务器更新成功" : "MCP服务器创建成功");
-            } catch (e) {
-                alert("保存失败: " + e.message);
-            }
-        });
-    }
-    
-    // MCP表单重置按钮
-    const mcpFormResetBtn = document.getElementById("mcp-form-reset");
-    if (mcpFormResetBtn) {
-        mcpFormResetBtn.addEventListener("click", () => {
-            if (mcpFormEl) {
-                mcpFormEl.reset();
-                document.getElementById("mcp-id").value = "";
-                document.getElementById("mcp-stdio-config").style.display = "none";
-                document.getElementById("mcp-http-config").style.display = "none";
-            }
-        });
-    }
-    
-    // MCP测试连接按钮
-    const mcpTestBtn = document.getElementById("mcp-test-connection");
-    if (mcpTestBtn) {
-        mcpTestBtn.addEventListener("click", async () => {
-            const id = document.getElementById("mcp-id").value;
-            if (!id) {
-                alert("请先保存MCP服务器配置后再测试连接");
-                return;
-            }
-            
-            mcpTestBtn.textContent = "测试中...";
-            mcpTestBtn.disabled = true;
-            
-            try {
-                const res = await fetch(`${apiBase}/mcp/servers/${id}/test`, { method: "POST" });
-                const result = await res.json();
-                
-                if (result.success) {
-                    alert("✓ 连接测试成功！");
-                } else {
-                    alert("✗ 连接测试失败: " + (result.error || "未知错误"));
-                }
-            } catch (e) {
-                alert("测试失败: " + e.message);
-            }
-            
-            mcpTestBtn.textContent = "测试连接";
-            mcpTestBtn.disabled = false;
         });
     }
 }
@@ -3584,7 +5408,6 @@ function initSearchConfigForm() {
     document.addEventListener("DOMContentLoaded", () => {
         setTimeout(() => {
             initKnowledgeBaseForms();
-            initMCPForms();
             initSearchConfigForm();
             
             // 当打开知识库模态框时渲染列表
@@ -3673,6 +5496,8 @@ function renderProviderList() {
                 const res = await fetch(`${apiBase}/providers/${providerId}`, { method: "DELETE" });
                 if (!res.ok) throw new Error("删除失败");
                 await loadProviders();
+                await loadModels();
+                await loadSettings(); // 刷新设置页面的模型下拉框
                 renderProviderList();
                 renderProviderSelect();
                 
@@ -3876,6 +5701,10 @@ function initProviderForms() {
                 
                 await loadProviders();
                 await loadModels();
+                await loadSettings(); // 刷新设置页面的模型下拉框
+                await loadEmbeddingModels(); // 刷新向量模型
+                await loadVisionModels(); // 刷新视觉模型
+                await loadRerankModels(); // 刷新重排模型
                 renderProviderList();
                 renderProviderSelect();
                 resetProviderForm();
@@ -3952,6 +5781,7 @@ function resetApiKeyInput() {
 document.addEventListener("DOMContentLoaded", () => {
     setTimeout(() => {
         initProviderForms();
+        initMCPForm();
         renderProviderList();
     }, 600);
 });
@@ -4015,8 +5845,7 @@ const modelHelpData = {
             { name: "text-embedding-v3", provider: "通义千问" },
             { name: "text-embedding-v2", provider: "通义千问" },
         ],
-        note: "向量模型用于将文本转换为数值向量，不同 Provider 支持的模型不同。请确保你的 Provider 支持所选模型。",
-        localNote: "🏠 <strong>本地方案</strong>：安装 <code>mcp-local-rag</code> 后可使用本地向量模型，无需 API Key，完全离线运行。安装命令：<code>npx mcp-local-rag</code>"
+        note: "向量模型用于将文本转换为数值向量，不同 Provider 支持的模型不同。请确保你的 Provider 支持所选模型。"
     },
     rerank: {
         title: "🔄 支持的重排模型",
@@ -4039,8 +5868,7 @@ const modelHelpData = {
             { name: "qwen-vl-max", provider: "通义千问" },
             { name: "qwen-vl-plus", provider: "通义千问" },
         ],
-        note: "视觉模型用于识别扫描件/图片 PDF 中的文字。如果你的 PDF 是文字版（可选中文字），则不需要此功能。",
-        localNote: "🏠 <strong>本地方案</strong>：安装 Tesseract OCR 后可使用本地 OCR，无需 API Key，完全离线运行。<a href='https://github.com/UB-Mannheim/tesseract/wiki' target='_blank'>下载安装包</a>"
+        note: "视觉模型用于识别扫描件/图片 PDF 中的文字。如果你的 PDF 是文字版（可选中文字），则不需要此功能。"
     }
 };
 
@@ -4060,11 +5888,6 @@ function showModelHelp(type, anchorElement) {
     });
     html += '</ul>';
     html += `<div class="help-note"><strong>💡 提示</strong>${data.note}</div>`;
-    
-    // 如果有本地方案提示，添加到末尾
-    if (data.localNote) {
-        html += `<div class="help-note local-note">${data.localNote}</div>`;
-    }
     
     contentEl.innerHTML = html;
     
@@ -4113,3 +5936,250 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     });
 });
+
+// ========== 对话文件上传功能 ==========
+
+// 获取文件图标
+function getFileIcon(filename) {
+    const ext = filename.split('.').pop().toLowerCase();
+    const iconMap = {
+        'pdf': '📄',
+        'doc': '📝', 'docx': '📝',
+        'txt': '📃', 'md': '📃',
+        'csv': '📊', 'xlsx': '📊', 'xls': '📊',
+        'json': '📋', 'xml': '📋',
+        'html': '🌐', 'htm': '🌐',
+        'png': '🖼️', 'jpg': '🖼️', 'jpeg': '🖼️', 'gif': '🖼️', 'webp': '🖼️', 'bmp': '🖼️'
+    };
+    return iconMap[ext] || '📎';
+}
+
+// 渲染已上传文件列表
+function renderUploadedFiles() {
+    if (!uploadedFilesListEl || !uploadedFilesPreviewEl) return;
+    
+    if (uploadedFiles.length === 0) {
+        uploadedFilesPreviewEl.style.display = 'none';
+        return;
+    }
+    
+    uploadedFilesPreviewEl.style.display = 'block';
+    uploadedFilesListEl.innerHTML = uploadedFiles.map((file, index) => `
+        <div class="uploaded-file-item ${file.uploading ? 'uploading' : ''} ${file.error ? 'error' : ''}" data-index="${index}">
+            <span class="file-icon">${getFileIcon(file.filename)}</span>
+            <span class="file-name" title="${file.filename}">${file.filename}</span>
+            <button class="file-remove" data-file-id="${file.id}" title="删除">×</button>
+        </div>
+    `).join('');
+    
+    // 绑定删除按钮事件
+    uploadedFilesListEl.querySelectorAll('.file-remove').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const fileId = btn.dataset.fileId;
+            await removeUploadedFile(fileId);
+        });
+    });
+    
+    // 更新视觉识别开关的显示状态
+    updateVisionToggleVisibility();
+}
+
+// 更新视觉识别开关的显示状态
+function updateVisionToggleVisibility() {
+    const visionToggleWrapper = document.getElementById('vision-toggle-wrapper');
+    if (!visionToggleWrapper) return;
+    
+    // 检查当前模型是否支持视觉
+    const currentModel = modelSelectEl ? modelSelectEl.value : '';
+    const caps = modelsCaps[currentModel] || {};
+    
+    // 检查是否有上传的文件（图片或文档）
+    const hasFiles = uploadedFiles.length > 0;
+    
+    if (!caps.vision && hasFiles) {
+        // 模型不支持视觉且有文件，显示开关
+        visionToggleWrapper.style.display = '';
+    } else {
+        // 模型支持视觉或没有文件，隐藏开关
+        visionToggleWrapper.style.display = 'none';
+        // 隐藏时取消勾选
+        const visionToggle = document.getElementById('toggle-vision-recognition');
+        if (visionToggle) visionToggle.checked = false;
+    }
+}
+
+// 上传文件到服务器
+async function uploadFileToServer(file) {
+    if (!currentConversationId) {
+        alert('请先选择或创建一个对话');
+        return null;
+    }
+    
+    const formData = new FormData();
+    formData.append('conversation_id', currentConversationId);
+    formData.append('file', file);
+    
+    try {
+        const res = await fetch(`${apiBase}/upload`, {
+            method: 'POST',
+            body: formData
+        });
+        
+        if (!res.ok) {
+            const err = await res.text();
+            throw new Error(err || '上传失败');
+        }
+        
+        return await res.json();
+    } catch (e) {
+        console.error('文件上传失败:', e);
+        throw e;
+    }
+}
+
+// 处理文件上传
+async function handleFileUpload(files) {
+    if (!files || files.length === 0) return;
+    if (!currentConversationId) {
+        alert('请先选择或创建一个对话');
+        return;
+    }
+    
+    for (const file of files) {
+        // 检查文件大小（限制 20MB）
+        if (file.size > 20 * 1024 * 1024) {
+            alert(`文件 "${file.name}" 超过 20MB 限制`);
+            continue;
+        }
+        
+        // 添加到列表（显示上传中状态）
+        const tempFile = {
+            id: 'temp_' + Date.now() + '_' + Math.random(),
+            filename: file.name,
+            uploading: true
+        };
+        uploadedFiles.push(tempFile);
+        renderUploadedFiles();
+        
+        try {
+            const result = await uploadFileToServer(file);
+            // 更新文件信息
+            const index = uploadedFiles.findIndex(f => f.id === tempFile.id);
+            if (index !== -1) {
+                uploadedFiles[index] = {
+                    id: result.id,
+                    filename: result.filename,
+                    filepath: result.filepath,
+                    uploading: false
+                };
+            }
+        } catch (e) {
+            // 标记为错误状态
+            const index = uploadedFiles.findIndex(f => f.id === tempFile.id);
+            if (index !== -1) {
+                uploadedFiles[index].uploading = false;
+                uploadedFiles[index].error = true;
+            }
+        }
+        
+        renderUploadedFiles();
+        updateVisionToggleVisibility();  // 更新视觉识别开关显示状态
+    }
+}
+
+// 删除已上传的文件
+async function removeUploadedFile(fileId) {
+    // 如果是临时文件（上传中或错误），直接从列表移除
+    if (String(fileId).startsWith('temp_')) {
+        uploadedFiles = uploadedFiles.filter(f => f.id !== fileId);
+        renderUploadedFiles();
+        updateVisionToggleVisibility();  // 更新视觉识别开关显示状态
+        return;
+    }
+    
+    try {
+        const res = await fetch(`${apiBase}/files/${fileId}`, {
+            method: 'DELETE'
+        });
+        
+        if (res.ok) {
+            uploadedFiles = uploadedFiles.filter(f => f.id !== parseInt(fileId));
+            renderUploadedFiles();
+            updateVisionToggleVisibility();  // 更新视觉识别开关显示状态
+        }
+    } catch (e) {
+        console.error('删除文件失败:', e);
+    }
+}
+
+// 加载对话的已上传文件
+async function loadConversationFiles(conversationId) {
+    // 清空预览区 - 切换对话时不显示之前的文件
+    // 文件已经在消息中显示，不需要在输入框上方再显示
+    uploadedFiles = [];
+    renderUploadedFiles();
+}
+
+// 初始化文件上传功能
+function initFileUpload() {
+    // 文件选择按钮
+    if (fileUploadInputEl) {
+        fileUploadInputEl.addEventListener('change', (e) => {
+            handleFileUpload(e.target.files);
+            e.target.value = ''; // 清空以便重复选择同一文件
+        });
+    }
+    
+    // 拖拽上传
+    if (mainPanelEl && dropOverlayEl) {
+        let dragCounter = 0;
+        
+        mainPanelEl.addEventListener('dragenter', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dragCounter++;
+            dropOverlayEl.classList.add('active');
+        });
+        
+        mainPanelEl.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dragCounter--;
+            if (dragCounter === 0) {
+                dropOverlayEl.classList.remove('active');
+            }
+        });
+        
+        mainPanelEl.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+        });
+        
+        mainPanelEl.addEventListener('drop', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dragCounter = 0;
+            dropOverlayEl.classList.remove('active');
+            
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                handleFileUpload(files);
+            }
+        });
+    }
+    
+    // Ctrl+V 粘贴文件
+    document.addEventListener('paste', (e) => {
+        // 如果焦点在输入框且粘贴的是文本，不处理
+        if (document.activeElement === userInputEl && !e.clipboardData.files.length) {
+            return;
+        }
+        
+        const files = e.clipboardData.files;
+        if (files.length > 0) {
+            e.preventDefault();
+            handleFileUpload(files);
+        }
+    });
+}

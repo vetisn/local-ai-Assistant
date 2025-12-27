@@ -32,12 +32,32 @@ def migrate_database():
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
-        # 检查并添加 models_config 列
+        # 检查并添加 models_config 列到 providers 表
         cursor.execute("PRAGMA table_info(providers)")
         columns = [col[1] for col in cursor.fetchall()]
         
         if 'models_config' not in columns:
             cursor.execute("ALTER TABLE providers ADD COLUMN models_config TEXT")
+            conn.commit()
+        
+        # 检查并添加 tool_calls、thinking_content 和 vision_content 列到 messages 表
+        cursor.execute("PRAGMA table_info(messages)")
+        msg_columns = [col[1] for col in cursor.fetchall()]
+        
+        if 'tool_calls' not in msg_columns:
+            cursor.execute("ALTER TABLE messages ADD COLUMN tool_calls TEXT")
+            conn.commit()
+        
+        if 'thinking_content' not in msg_columns:
+            cursor.execute("ALTER TABLE messages ADD COLUMN thinking_content TEXT")
+            conn.commit()
+        
+        if 'vision_content' not in msg_columns:
+            cursor.execute("ALTER TABLE messages ADD COLUMN vision_content TEXT")
+            conn.commit()
+        
+        if 'message_events' not in msg_columns:
+            cursor.execute("ALTER TABLE messages ADD COLUMN message_events TEXT")
             conn.commit()
         
         conn.close()
