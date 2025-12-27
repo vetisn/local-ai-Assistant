@@ -184,6 +184,29 @@ def get_uploaded_files(db: Session, conversation_id: int) -> List[models.Uploade
     )
 
 
+def get_unprocessed_files(db: Session, conversation_id: int) -> List[models.UploadedFile]:
+    """获取未处理的文件（还没有发送给AI的文件）"""
+    return (
+        db.query(models.UploadedFile)
+        .filter(
+            models.UploadedFile.conversation_id == conversation_id,
+            models.UploadedFile.processed == False
+        )
+        .order_by(models.UploadedFile.id.asc())
+        .all()
+    )
+
+
+def mark_files_as_processed(db: Session, file_ids: List[int]) -> None:
+    """标记文件为已处理"""
+    if not file_ids:
+        return
+    db.query(models.UploadedFile).filter(
+        models.UploadedFile.id.in_(file_ids)
+    ).update({models.UploadedFile.processed: True}, synchronize_session=False)
+    db.commit()
+
+
 def get_uploaded_file(db: Session, file_id: int) -> Optional[models.UploadedFile]:
     return db.query(models.UploadedFile).filter(models.UploadedFile.id == file_id).first()
 

@@ -122,6 +122,9 @@ class UploadedFile(Base):
     filename = Column(String(255), nullable=False)
     filepath = Column(String(1024), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # 标记文件是否已被处理（发送给AI）
+    processed = Column(Boolean, default=False, nullable=False)
 
     conversation = relationship("Conversation", back_populates="files")
 
@@ -132,6 +135,7 @@ class UploadedFile(Base):
             "filename": self.filename,
             "filepath": self.filepath,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "processed": self.processed,
         }
 
 

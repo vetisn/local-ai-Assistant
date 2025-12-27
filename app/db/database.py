@@ -60,6 +60,14 @@ def migrate_database():
             cursor.execute("ALTER TABLE messages ADD COLUMN message_events TEXT")
             conn.commit()
         
+        # 检查并添加 processed 列到 uploaded_files 表
+        cursor.execute("PRAGMA table_info(uploaded_files)")
+        file_columns = [col[1] for col in cursor.fetchall()]
+        
+        if 'processed' not in file_columns:
+            cursor.execute("ALTER TABLE uploaded_files ADD COLUMN processed INTEGER DEFAULT 0")
+            conn.commit()
+        
         conn.close()
     except Exception:
         pass  # 静默处理迁移错误

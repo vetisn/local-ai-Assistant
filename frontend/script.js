@@ -722,6 +722,10 @@ async function loadModels() {
         // 添加模型选择变化监听
         modelSelectEl.removeEventListener("change", updateModelCapsBadge);
         modelSelectEl.addEventListener("change", updateModelCapsBadge);
+        
+        // 模型变化时也更新视觉识别开关
+        modelSelectEl.removeEventListener("change", updateVisionToggleVisibility);
+        modelSelectEl.addEventListener("change", updateVisionToggleVisibility);
     } catch(e) { console.error(e); }
 }
 
@@ -2316,10 +2320,10 @@ async function regenerateLastMessage() {
         formData.append("enable_thinking", "true");
     }
     
-    // 视觉识别开关
-    const visionToggle = document.getElementById('toggle-vision-recognition');
-    if (visionToggle && visionToggle.checked && !caps.vision && uploadedFiles.length > 0) {
-        formData.append("force_vision_recognition", "true");
+    // 视觉识别模式
+    const visionMode = getVisionMode();
+    if (!caps.vision && uploadedFiles.length > 0 && visionMode !== "none") {
+        formData.append("vision_mode", visionMode);
     }
     
     // 流式传输
@@ -2472,7 +2476,7 @@ async function regenerateLastMessage() {
                             visionHint.innerHTML = `
                                 <details class="vision-details" open>
                                     <summary><span class="vision-icon">👁️</span> <span class="vision-status">${statusMessage}</span></summary>
-                                    <div class="vision-content"></div>
+                                    <div class="vision-content markdown-body"></div>
                                 </details>
                             `;
                             scrollToBottom();
@@ -2506,10 +2510,21 @@ async function regenerateLastMessage() {
                         const chunkText = JSON.parse(payload);
                         const hintsEl = assistantEl?.querySelector(".message-hints");
                         if (hintsEl) {
-                            const visionContent = hintsEl.querySelector(".vision-hint .vision-content");
+                            const visionHint = hintsEl.querySelector(".vision-hint");
+                            const visionContent = visionHint?.querySelector(".vision-content");
                             if (visionContent && chunkText) {
-                                // 追加识别内容
-                                visionContent.innerHTML += chunkText.replace(/\n/g, '<br>');
+                                // 累积原始文本
+                                if (!visionContent.dataset.rawContent) {
+                                    visionContent.dataset.rawContent = "";
+                                }
+                                visionContent.dataset.rawContent += chunkText;
+                                
+                                // 使用 Markdown 流式渲染
+                                if (window.MarkdownEngine && window.MarkdownEngine.renderStreaming) {
+                                    window.MarkdownEngine.renderStreaming(visionContent, visionContent.dataset.rawContent);
+                                } else {
+                                    visionContent.innerHTML = visionContent.dataset.rawContent.replace(/\n/g, '<br>');
+                                }
                                 scrollToBottom();
                             }
                         }
@@ -2525,8 +2540,10 @@ async function regenerateLastMessage() {
                         if (hintsEl) {
                             let visionHint = hintsEl.querySelector(".vision-hint");
                             if (visionHint) {
-                                // 获取已有的识别内容
-                                const existingContent = visionHint.querySelector(".vision-content")?.innerHTML || "";
+                                // 获取累积的原始内容
+                                const visionContentEl = visionHint.querySelector(".vision-content");
+                                const rawContent = visionContentEl?.dataset?.rawContent || visionContentEl?.textContent || "";
+                                
                                 const fileTypeMap = {
                                     "pdf": "PDF",
                                     "image": "图片",
@@ -2538,10 +2555,21 @@ async function regenerateLastMessage() {
                                 visionHint.innerHTML = `
                                     <details class="vision-details">
                                         <summary><span class="vision-icon">👁️</span> ${fileTypeText}识别完成</summary>
-                                        <div class="vision-content">${existingContent}</div>
+                                        <div class="vision-content markdown-body"></div>
                                     </details>
                                 `;
                                 visionHint.classList.add("completed");
+                                
+                                // 使用 Markdown 渲染视觉识别内容
+                                const visionContentNewEl = visionHint.querySelector('.vision-content');
+                                if (visionContentNewEl) {
+                                    if (window.MarkdownEngine && window.MarkdownEngine.renderFinal) {
+                                        window.MarkdownEngine.renderFinal(visionContentNewEl, rawContent);
+                                    } else {
+                                        visionContentNewEl.innerHTML = rawContent.replace(/\n/g, '<br>');
+                                    }
+                                }
+                                
                                 scrollToBottom();
                             }
                         }
@@ -3130,9 +3158,8 @@ async function sendMessage() {
     const filesForDisplay = uploadedFiles.length > 0 ? { files: [...uploadedFiles] } : null;
     const hadUploadedFiles = uploadedFiles.length > 0;  // 保存文件状态
     
-    // 在清空文件之前，保存视觉识别开关的状态（因为updateVisionToggleVisibility会取消勾选）
-    const visionToggle = document.getElementById('toggle-vision-recognition');
-    const forceVisionRecognition = visionToggle && visionToggle.checked && hadUploadedFiles;
+    // 在清空文件之前，保存视觉识别模式（因为updateVisionToggleVisibility会重置）
+    const visionMode = getVisionMode();
     
     appendMessage("user", text, null, true, filesForDisplay);
     
@@ -3173,9 +3200,9 @@ async function sendMessage() {
         formData.append("enable_thinking", "true");
     }
     
-    // 视觉识别开关（使用之前保存的状态，因为updateVisionToggleVisibility已经取消勾选了）
-    if (forceVisionRecognition && !caps.vision) {
-        formData.append("force_vision_recognition", "true");
+    // 视觉识别模式（仅当模型不支持视觉且有文件时有效）
+    if (hadUploadedFiles && !caps.vision && visionMode !== "none") {
+        formData.append("vision_mode", visionMode);
     }
     
     // 流式传输
@@ -3645,7 +3672,7 @@ async function sendMessage() {
                             visionHint.innerHTML = `
                                 <details class="vision-details" open>
                                     <summary><span class="vision-icon">👁️</span> <span class="vision-status">${statusMessage}</span></summary>
-                                    <div class="vision-content"></div>
+                                    <div class="vision-content markdown-body"></div>
                                 </details>
                             `;
                             scrollToBottom();
@@ -3679,9 +3706,21 @@ async function sendMessage() {
                         const chunkText = JSON.parse(payload);
                         const hintsEl = assistantEl?.querySelector(".message-hints");
                         if (hintsEl) {
-                            const visionContent = hintsEl.querySelector(".vision-hint .vision-content");
+                            const visionHint = hintsEl.querySelector(".vision-hint");
+                            const visionContent = visionHint?.querySelector(".vision-content");
                             if (visionContent && chunkText) {
-                                visionContent.innerHTML += chunkText.replace(/\n/g, '<br>');
+                                // 累积原始文本
+                                if (!visionContent.dataset.rawContent) {
+                                    visionContent.dataset.rawContent = "";
+                                }
+                                visionContent.dataset.rawContent += chunkText;
+                                
+                                // 使用 Markdown 流式渲染
+                                if (window.MarkdownEngine && window.MarkdownEngine.renderStreaming) {
+                                    window.MarkdownEngine.renderStreaming(visionContent, visionContent.dataset.rawContent);
+                                } else {
+                                    visionContent.innerHTML = visionContent.dataset.rawContent.replace(/\n/g, '<br>');
+                                }
                                 scrollToBottom();
                             }
                         }
@@ -3698,20 +3737,35 @@ async function sendMessage() {
                         if (hintsEl) {
                             let visionHint = hintsEl.querySelector(".vision-hint");
                             if (visionHint) {
-                                const existingContent = visionHint.querySelector(".vision-content")?.innerHTML || "";
+                                // 获取累积的原始内容
+                                const visionContentEl = visionHint.querySelector(".vision-content");
+                                const rawContent = visionContentEl?.dataset?.rawContent || visionContentEl?.textContent || "";
+                                
                                 const fileTypeMap = {
                                     "pdf": "PDF",
                                     "image": "图片",
                                     "document": "文档"
                                 };
                                 const fileTypeText = fileTypeMap[visionData.file_type] || "文件";
+                                
                                 visionHint.innerHTML = `
                                     <details class="vision-details">
                                         <summary><span class="vision-icon">👁️</span> <span class="vision-status">${fileTypeText}识别完成</span></summary>
-                                        <div class="vision-content">${existingContent}</div>
+                                        <div class="vision-content markdown-body"></div>
                                     </details>
                                 `;
                                 visionHint.classList.add("completed");
+                                
+                                // 使用 Markdown 渲染视觉识别内容
+                                const visionContentNewEl = visionHint.querySelector('.vision-content');
+                                if (visionContentNewEl) {
+                                    if (window.MarkdownEngine && window.MarkdownEngine.renderFinal) {
+                                        window.MarkdownEngine.renderFinal(visionContentNewEl, rawContent);
+                                    } else {
+                                        visionContentNewEl.innerHTML = rawContent.replace(/\n/g, '<br>');
+                                    }
+                                }
+                                
                                 scrollToBottom();
                             }
                         }
@@ -3988,7 +4042,8 @@ async function loadMessages(conversationId) {
 
         scrollToBottom();
         
-        // 异步加载文件并更新第一条用户消息（不阻塞消息显示）
+        // 异步加载文件并显示在用户消息中
+        // 由于文件是关联到对话而不是单条消息，所以显示在第一条用户消息上
         if (firstUserMsgEl) {
             loadAndShowFilesForMessage(conversationId, firstUserMsgEl);
         }
@@ -4003,10 +4058,15 @@ async function loadMessages(conversationId) {
 // 异步加载对话文件并显示在消息中
 async function loadAndShowFilesForMessage(conversationId, msgEl) {
     try {
+        console.log('[Files] 加载对话文件, conversationId:', conversationId);
         const filesRes = await fetch(`${apiBase}/conversations/${conversationId}/files`);
-        if (!filesRes.ok) return;
+        if (!filesRes.ok) {
+            console.warn('[Files] 加载文件失败, status:', filesRes.status);
+            return;
+        }
         
         const files = await filesRes.json();
+        console.log('[Files] 获取到文件:', files);
         if (!files || files.length === 0) return;
         
         // 检查是否已经有文件显示
@@ -4667,6 +4727,7 @@ async function init() {
         loadToolSettings();
         setupToolSettingsListeners();
         initThinkingToggle();
+        initVisionPopup();  // 初始化视觉识别弹出框
         setupEventListeners();
         setupSettingsEventListeners();
         
@@ -5986,7 +6047,7 @@ function renderUploadedFiles() {
 }
 
 // 更新视觉识别开关的显示状态
-function updateVisionToggleVisibility() {
+async function updateVisionToggleVisibility() {
     const visionToggleWrapper = document.getElementById('vision-toggle-wrapper');
     if (!visionToggleWrapper) return;
     
@@ -5994,19 +6055,105 @@ function updateVisionToggleVisibility() {
     const currentModel = modelSelectEl ? modelSelectEl.value : '';
     const caps = modelsCaps[currentModel] || {};
     
-    // 检查是否有上传的文件（图片或文档）
-    const hasFiles = uploadedFiles.length > 0;
+    // 检查是否有上传的文件（当前待发送的文件）
+    let hasFiles = uploadedFiles.length > 0;
     
-    if (!caps.vision && hasFiles) {
+    // 如果当前没有待发送的文件，检查对话是否有历史文件
+    if (!hasFiles && currentConversationId) {
+        try {
+            const res = await fetch(`${apiBase}/conversations/${currentConversationId}/files`);
+            if (res.ok) {
+                const files = await res.json();
+                hasFiles = files && files.length > 0;
+            }
+        } catch (e) {
+            // 忽略错误
+        }
+    }
+    
+    // 只有当模型明确配置了 vision: true 时才认为支持视觉
+    const supportsVision = caps.vision === true;
+    
+    if (!supportsVision && hasFiles) {
         // 模型不支持视觉且有文件，显示开关
         visionToggleWrapper.style.display = '';
     } else {
         // 模型支持视觉或没有文件，隐藏开关
         visionToggleWrapper.style.display = 'none';
-        // 隐藏时取消勾选
+        // 隐藏时重置为不启用
+        const noneRadio = document.querySelector('input[name="vision-mode"][value="none"]');
+        if (noneRadio) noneRadio.checked = true;
         const visionToggle = document.getElementById('toggle-vision-recognition');
         if (visionToggle) visionToggle.checked = false;
     }
+}
+
+// 获取当前选择的视觉识别模式
+function getVisionMode() {
+    const checkedRadio = document.querySelector('input[name="vision-mode"]:checked');
+    return checkedRadio ? checkedRadio.value : 'none';
+}
+
+// 初始化视觉识别弹出框
+function initVisionPopup() {
+    const wrapper = document.getElementById('vision-toggle-wrapper');
+    const toggle = document.getElementById('toggle-vision-recognition');
+    const popup = document.getElementById('vision-popup');
+    const label = wrapper?.querySelector('label');
+    
+    if (!wrapper || !toggle || !popup) return;
+    
+    // 更新弹出框位置
+    function updatePopupPosition() {
+        const rect = wrapper.getBoundingClientRect();
+        popup.style.left = rect.left + 'px';
+        popup.style.bottom = (window.innerHeight - rect.top + 8) + 'px';
+    }
+    
+    // 阻止 checkbox 的默认行为，改为只控制弹出框
+    if (label) {
+        label.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            
+            const isOpening = !wrapper.classList.contains('open');
+            
+            // 关闭其他弹出框
+            document.querySelectorAll('.toggle-with-popup.open').forEach(el => {
+                if (el !== wrapper) el.classList.remove('open');
+            });
+            
+            if (isOpening) {
+                wrapper.classList.add('open');
+                updatePopupPosition();
+            } else {
+                wrapper.classList.remove('open');
+            }
+        });
+    }
+    
+    // 阻止弹出框内的点击事件冒泡
+    popup.addEventListener('click', (e) => {
+        e.stopPropagation();
+    });
+    
+    // 选择选项时更新复选框状态（控制按钮是否亮起）
+    document.querySelectorAll('input[name="vision-mode"]').forEach(radio => {
+        radio.addEventListener('change', () => {
+            const mode = radio.value;
+            // 选择 ocr 或 vision 时按钮亮起，选择 none 时不亮
+            toggle.checked = (mode !== 'none');
+            // 选择后关闭弹出框
+            wrapper.classList.remove('open');
+        });
+    });
+    
+    // 点击外部关闭弹出框
+    document.addEventListener('click', (e) => {
+        if (!wrapper.contains(e.target)) {
+            wrapper.classList.remove('open');
+        }
+    });
 }
 
 // 上传文件到服务器
@@ -6115,10 +6262,13 @@ async function removeUploadedFile(fileId) {
 
 // 加载对话的已上传文件
 async function loadConversationFiles(conversationId) {
-    // 清空预览区 - 切换对话时不显示之前的文件
-    // 文件已经在消息中显示，不需要在输入框上方再显示
+    // 清空输入框上方的预览区
     uploadedFiles = [];
     renderUploadedFiles();
+    
+    // 注意：历史文件已经在 loadMessages -> loadAndShowFilesForMessage 中显示
+    // 这里不需要再加载，但需要更新视觉识别开关状态
+    updateVisionToggleVisibility();
 }
 
 // 初始化文件上传功能

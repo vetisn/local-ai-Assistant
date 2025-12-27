@@ -12,7 +12,7 @@
     <link rel="stylesheet" href="lib/katex.min.css">
     
     <!-- 引入外部CSS -->
-    <link rel="stylesheet" href="style.css?v=172">
+    <link rel="stylesheet" href="style.css?v=179">
     
     <!-- Markdown解析 -->
     <script src="lib/marked.min.js"></script>
@@ -91,8 +91,25 @@
                     </div>
                     
                     <!-- 视觉识别开关（当模型不支持视觉时显示） -->
-                    <div id="vision-toggle-wrapper" style="display: none;">
-                        <label class="custom-tooltip " data-tooltip="视觉识别（使用视觉模型识别图片内容）"><input type="checkbox" id="toggle-vision-recognition"><span>👁️</span></label>
+                    <div class="toggle-with-popup" id="vision-toggle-wrapper" style="display: none;">
+                        <label class="custom-tooltip " data-tooltip="图片/文档识别方式"><input type="checkbox" id="toggle-vision-recognition"><span>👁️</span></label>
+                        <div class="toggle-popup" id="vision-popup">
+                            <div class="toggle-popup-title">图片/文档识别</div>
+                            <div class="toggle-popup-options">
+                                <label class="vision-option">
+                                    <input type="radio" name="vision-mode" value="none" checked>
+                                    <span>不启用</span>
+                                </label>
+                                <label class="vision-option">
+                                    <input type="radio" name="vision-mode" value="ocr">
+                                    <span>本地 OCR</span>
+                                </label>
+                                <label class="vision-option">
+                                    <input type="radio" name="vision-mode" value="vision">
+                                    <span>视觉模型</span>
+                                </label>
+                            </div>
+                        </div>
                     </div>
                     
                     <!-- 生图模式 -->
@@ -173,7 +190,8 @@
                     <div class="settings-row">
                         <label>
                             默认对话模型
-                            <span class="help-icon custom-tooltip" data-tooltip="新对话时默认使用的模型。选择'记忆上次选择'则自动使用上次选择的模型">?</span>
+                            <span class="help-icon custom-tooltip" data-tooltip="新对话时默认使用的模型
+选择'记忆上次选择'则自动使用上次选择的模型">?</span>
                         </label>
                         <select id="default-chat-model-select">
                             <option value="remember_last">记忆上次选择</option>
@@ -183,7 +201,8 @@
                     <div class="settings-row">
                         <label>
                             自动命名模型
-                            <span class="help-icon custom-tooltip" data-tooltip="新对话发送第一条消息后，将使用此模型自动生成对话标题。选择'使用当前对话模型'则使用对话中选择的模型">?</span>
+                            <span class="help-icon custom-tooltip" data-tooltip="新对话发送第一条消息后，将使用此模型自动生成对话标题
+选择'使用当前对话模型'则使用对话中选择的模型">?</span>
                         </label>
                         <select id="auto-title-model-select">
                             <option value="current">使用当前对话模型</option>
@@ -192,7 +211,8 @@
                     <div class="settings-row">
                         <label>
                             默认视觉模型
-                            <span class="help-icon custom-tooltip" data-tooltip="当对话模型不支持图片识别时，将使用此模型解析图片内容，&#10;再将结果发送给对话模型处理">?</span>
+                            <span class="help-icon custom-tooltip" data-tooltip="当对话模型不支持图片识别时，
+将使用此模型解析图片内容，再将结果发送给对话模型处理">?</span>
                         </label>
                         <select id="default-vision-model-select">
                             <option value="">不启用</option>
@@ -350,7 +370,8 @@
                             <div class="form-row">
                                 <label>
                                     向量模型 <span class="required-badge">必选</span>
-                                    <span class="help-icon custom-tooltip" data-tooltip="用于将文本转换为向量，支持 text-embedding-3-small 等模型">?</span>
+                                    <span class="help-icon custom-tooltip" data-tooltip="用于将文本转换为向量，实现语义搜索
+支持 text-embedding-3-small 等模型">?</span>
                                 </label>
                                 <select id="embedding-model-select">
                                     <option value="">请选择向量模型</option>
@@ -361,7 +382,8 @@
                             <div class="form-row">
                                 <label>
                                     重排模型 <span class="optional-badge">可选</span>
-                                    <span class="help-icon custom-tooltip" data-tooltip="用于对检索结果重新排序，提高相关性，支持 rerank 类模型">?</span>
+                                    <span class="help-icon custom-tooltip" data-tooltip="用于对检索结果重新排序，提高相关性
+支持 rerank 类模型">?</span>
                                 </label>
                                 <select id="rerank-model-select">
                                     <option value="">不使用重排模型</option>
@@ -372,7 +394,8 @@
                             <div class="form-row">
                                 <label>
                                     图片识别方案 <span class="optional-badge">可选</span>
-                                    <span class="help-icon custom-tooltip" data-tooltip="用于识别文档中的图片内容，支持视觉模型如 gpt-4o、gemini-pro-vision 等">?</span>
+                                    <span class="help-icon custom-tooltip" data-tooltip="用于识别文档中的图片内容
+支持视觉模型如 gpt-4o、gemini-pro-vision 等">?</span>
                                 </label>
                                 <select id="kb-vision-model-select">
                                     <option value="">不启用</option>
@@ -540,7 +563,7 @@
 <script src="markdown.js?v=131"></script>
 
 <!-- 引入外部JavaScript -->
-<script src="script.js?v=206"></script>
+<script src="script.js?v=210"></script>
 
 </body>
 </html>

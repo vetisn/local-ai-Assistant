@@ -780,25 +780,36 @@ def _get_conversation_files_context(
     db: Session, 
     conversation_id: int,
     current_model: Optional[str] = None,
-    model_supports_vision: bool = False
-) -> tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    model_supports_vision: bool = False,
+    only_unprocessed: bool = True
+) -> tuple[str, List[Dict[str, Any]], List[Dict[str, Any]], List[int]]:
     """
     读取对话关联的文件内容,返回格式化的上下文字符串、图片列表和需要视觉识别的文件列表.
+    
+    参数:
+        - only_unprocessed: 是否只处理未处理的文件（默认True，只处理新上传的文件）
     
     返回:
         - file_context: 文本文件的内容
         - image_files: 图片文件列表 [{"filepath": ..., "filename": ...}]
         - files_need_vision: 需要视觉识别的文件列表(PDF/Word/PPT等本地解析无内容的)
+        - processed_file_ids: 本次处理的文件ID列表（用于标记为已处理）
     """
     from app.utils.document_parser import extract_text_from_file
     
-    files = crud.get_uploaded_files(db, conversation_id)
+    # 根据参数决定获取所有文件还是只获取未处理的文件
+    if only_unprocessed:
+        files = crud.get_unprocessed_files(db, conversation_id)
+    else:
+        files = crud.get_uploaded_files(db, conversation_id)
+    
     if not files:
-        return "", [], []
+        return "", [], [], []
     
     file_contents = []
     image_files = []
     files_need_vision = []  # 需要视觉识别的文件(PDF/Word/PPT)
+    processed_file_ids = []  # 本次处理的文件ID
     total_length = 0
     max_total_length = 50000  # 限制总长度约 50K 字符
     max_per_file = 15000  # 每个文件最多 15K 字符
@@ -816,12 +827,16 @@ def _get_conversation_files_context(
             if not os.path.exists(file_record.filepath):
                 continue
             
+            # 记录处理的文件ID
+            processed_file_ids.append(file_record.id)
+            
             # 检查是否是图片文件
             ext = os.path.splitext(file_record.filename)[1].lower()
             if ext in image_extensions:
                 image_files.append({
                     "filepath": file_record.filepath,
-                    "filename": file_record.filename
+                    "filename": file_record.filename,
+                    "file_id": file_record.id
                 })
                 continue
             
@@ -834,7 +849,8 @@ def _get_conversation_files_context(
                 files_need_vision.append({
                     "filepath": file_record.filepath,
                     "filename": file_record.filename,
-                    "file_type": ext[1:]  # 去掉点号:pdf, docx, pptx 等
+                    "file_type": ext[1:],  # 去掉点号:pdf, docx, pptx 等
+                    "file_id": file_record.id
                 })
                 continue
             
@@ -853,7 +869,7 @@ def _get_conversation_files_context(
             continue
     
     text_context = "\n\n".join(file_contents) if file_contents else ""
-    return text_context, image_files, files_need_vision
+    return text_context, image_files, files_need_vision, processed_file_ids
 
 def _recognize_images_with_ocr(
     image_files: List[Dict[str, Any]],
@@ -1563,8 +1579,8 @@ def chat_with_conversation(
     # 新增:深度思考开关
     enable_thinking: Optional[bool] = Form(None),
     
-    # 新增:强制启用视觉识别(用于PDF等文件)
-    force_vision_recognition: Optional[bool] = Form(None),
+    # 新增:视觉识别模式 (none=不启用, ocr=本地OCR, vision=视觉模型)
+    vision_mode: Optional[str] = Form(None),
 
     # 新增:指定本次使用的 provider(可选)
     provider_id: Optional[int] = Form(None),
@@ -1581,7 +1597,10 @@ def chat_with_conversation(
     enable_mcp = parse_bool(enable_mcp)
     enable_web_search = parse_bool(enable_web_search)
     enable_thinking = parse_bool(enable_thinking) or False
-    force_vision_recognition = parse_bool(force_vision_recognition) or False
+    # 视觉识别模式: none=不启用, ocr=本地OCR, vision=视觉模型
+    vision_mode = vision_mode or "none"
+    if vision_mode not in ("none", "ocr", "vision"):
+        vision_mode = "none"
     stream = parse_bool(stream) or False
     
     # 记录聊天请求
@@ -1643,8 +1662,8 @@ def chat_with_conversation(
             except:
                 pass
     
-    # 读取文件内容、图片列表和需要视觉识别的文档
-    file_context, image_files, files_need_vision = _get_conversation_files_context(db, conversation_id)
+    # 读取文件内容、图片列表和需要视觉识别的文档（只处理未处理的文件）
+    file_context, image_files, files_need_vision, processed_file_ids = _get_conversation_files_context(db, conversation_id, only_unprocessed=True)
     
     # 获取默认视觉模型(格式可能是 "provider_id:model_name" 或旧格式 "model_name")
     default_vision_model_setting = crud.get_setting(db, "default_vision_model")
@@ -1688,10 +1707,13 @@ def chat_with_conversation(
             pass  # 图片将在构建消息时处理
         else:
             # 当前模型不支持视觉
-            if force_vision_recognition and default_vision_model:
-                # 用户强制启用视觉识别，图片发给视觉模型
+            if vision_mode == "vision" and default_vision_model:
+                # 用户选择视觉模型识别，图片发给视觉模型
                 images_need_vision = image_files
-            # 否则默认使用 OCR(在后续处理中执行)
+            elif vision_mode == "ocr":
+                # 用户选择本地OCR，后续处理
+                pass
+            # vision_mode == "none" 时不做任何处理
     
     # 处理文档文件
     if model_supports_vision:
@@ -1701,25 +1723,27 @@ def chat_with_conversation(
             docs_need_vision = files_need_vision
     else:
         # 模型不支持视觉
-        if force_vision_recognition and default_vision_model:
-            # 场景3：勾选了眼睛按钮，对所有文档使用视觉模型
+        if vision_mode == "vision" and default_vision_model:
+            # 场景3：选择视觉模型，对所有文档使用视觉模型
             vision_doc_extensions = {'.pdf', '.doc', '.docx', '.ppt', '.pptx'}
             all_doc_files = []
-            files = crud.get_uploaded_files(db, conversation_id)
+            files = crud.get_unprocessed_files(db, conversation_id)
             for file_record in files:
                 ext = os.path.splitext(file_record.filename)[1].lower()
                 if ext in vision_doc_extensions and os.path.exists(file_record.filepath):
                     all_doc_files.append({
                         "filepath": file_record.filepath,
                         "filename": file_record.filename,
-                        "file_type": ext[1:]
+                        "file_type": ext[1:],
+                        "file_id": file_record.id
                     })
             if all_doc_files:
                 docs_need_vision = all_doc_files
-        else:
-            # 场景2：未勾选眼睛按钮，没有文字的文档用OCR
+        elif vision_mode == "ocr":
+            # 场景2：选择本地OCR，没有文字的文档用OCR
             if files_need_vision:
                 docs_need_ocr = files_need_vision
+        # vision_mode == "none" 时不做任何处理
     
     # 非流式模式下的处理
     image_context = ""
@@ -1727,8 +1751,8 @@ def chat_with_conversation(
     if not stream:
         # 处理图片
         if image_files and not model_supports_vision:
-            if force_vision_recognition and default_vision_model:
-                # 用户强制启用视觉识别
+            if vision_mode == "vision" and default_vision_model:
+                # 用户选择视觉模型识别
                 if vision_provider_id:
                     vision_provider = crud.get_provider(db, vision_provider_id)
                     if vision_provider:
@@ -1744,11 +1768,12 @@ def chat_with_conversation(
                         api_key=provider.api_key,
                         default_model=model
                     )
-            else:
-                # 默认使用 OCR
+            elif vision_mode == "ocr":
+                # 用户选择本地OCR
                 ocr_context, _ = _recognize_images_with_ocr(image_files, use_ocr=True)
                 if ocr_context:
                     image_context = ocr_context
+            # vision_mode == "none" 时不处理图片
         
         # 处理需要视觉模型识别的文档
         if docs_need_vision and default_vision_model:
@@ -1988,6 +2013,10 @@ def chat_with_conversation(
                 "token_info": token_info
             })
             
+            # 标记文件为已处理
+            if processed_file_ids:
+                crud.mark_files_as_processed(db, processed_file_ids)
+            
             # 记录整体性能
             total_time = (datetime.now() - start_time).total_seconds()
             logger.log_performance("聊天完成", total_time, {
@@ -2054,10 +2083,13 @@ def chat_with_conversation(
         stream_image_context = ""
         stream_doc_context = ""
         
+        # 调试日志
+        chat_logger.info(f"[STREAM] 图片处理检查: image_files={len(image_files) if image_files else 0}, model_supports_vision={model_supports_vision}, vision_mode={vision_mode}, default_vision_model={default_vision_model}")
+        
         # 处理图片
         if image_files and not model_supports_vision:
-            if force_vision_recognition and default_vision_model:
-                # 用户强制启用视觉识别
+            if vision_mode == "vision" and default_vision_model:
+                # 用户选择视觉模型识别
                 if vision_provider_id:
                     vision_provider = crud.get_provider(db, vision_provider_id)
                     if vision_provider:
@@ -2090,8 +2122,13 @@ def chat_with_conversation(
                         api_key=provider.api_key,
                         default_model=model
                     )
-            else:
-                # 默认使用 OCR
+            elif vision_mode == "ocr":
+                # 用户选择本地OCR
+                # 检查 OCR 是否可用
+                ocr_image_fn, is_ocr_available_fn = get_ocr_module()
+                ocr_available = is_ocr_available_fn() if is_ocr_available_fn else False
+                chat_logger.info(f"[STREAM] OCR 可用性检查: ocr_available={ocr_available}")
+                
                 # 发送开始事件
                 yield f"event: vision_start\ndata: {json.dumps({'model': '本地OCR', 'total': len(image_files), 'file_type': 'image', 'message': '正在进行图片识别...'}, ensure_ascii=False)}\n\n"
                 
@@ -2107,6 +2144,7 @@ def chat_with_conversation(
                     add_event("vision", ocr_context)
                 else:
                     yield f"event: vision_end\ndata: {json.dumps({'file_type': 'image', 'message': '未识别到文字'}, ensure_ascii=False)}\n\n"
+            # vision_mode == "none" 时不处理图片
         
         # 处理需要视觉模型识别的文档（场景1和场景3）
         if docs_need_vision and default_vision_model and not model_supports_vision:
@@ -2760,6 +2798,10 @@ def chat_with_conversation(
                                    tool_calls=tool_calls_json, thinking_content=full_thinking,
                                    vision_content=full_vision, message_events=message_events_json)
                 
+                # 标记文件为已处理
+                if processed_file_ids:
+                    crud.mark_files_as_processed(db, processed_file_ids)
+                
             except Exception as e:
                 chat_logger.error(f"[STREAM] 工具模式错误: {str(e)}")
                 import traceback
@@ -2856,6 +2898,10 @@ def chat_with_conversation(
                 crud.create_message(db, conversation_id, "assistant", full_text, token_info,
                                    tool_calls=None, thinking_content=full_thinking,
                                    vision_content=full_vision, message_events=message_events_json)
+                
+                # 标记文件为已处理
+                if processed_file_ids:
+                    crud.mark_files_as_processed(db, processed_file_ids)
                 
             except Exception as e:
                 chat_logger.error(f"[STREAM] 普通模式错误: {str(e)}")

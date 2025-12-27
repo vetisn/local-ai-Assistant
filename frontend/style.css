@@ -34,16 +34,16 @@
 .custom-tooltip::after {
     content: attr(data-tooltip);
     position: absolute;
-    top: calc(100% + 8px);
-    left: 50%;
-    transform: translateX(-50%);
+    top: 50%;
+    left: calc(100% + 8px);
+    transform: translateY(-50%);
     padding: 8px 12px;
     background: rgba(0, 0, 0, 0.85);
     color: #fff;
     font-size: 12px;
     font-weight: 400;
-    line-height: 1.5;
-    white-space: nowrap;
+    line-height: 1.6;
+    white-space: pre;
     border-radius: 6px;
     opacity: 0;
     visibility: hidden;
@@ -55,11 +55,11 @@
 .custom-tooltip::before {
     content: '';
     position: absolute;
-    top: calc(100% + 2px);
-    left: 50%;
-    transform: translateX(-50%);
+    top: 50%;
+    left: calc(100% + 2px);
+    transform: translateY(-50%);
     border: 6px solid transparent;
-    border-bottom-color: rgba(0, 0, 0, 0.85);
+    border-right-color: rgba(0, 0, 0, 0.85);
     opacity: 0;
     visibility: hidden;
     transition: opacity 0.2s ease, visibility 0.2s ease;
@@ -1286,6 +1286,57 @@ body {
 
 #image-gen-popup {
     min-width: 200px;
+}
+
+/* 视觉识别弹出框样式 */
+#vision-popup {
+    min-width: 180px;
+}
+
+#vision-popup .toggle-popup-options {
+    padding: 8px 0;
+}
+
+/* 视觉识别选项样式 */
+.vision-option {
+    display: flex !important;
+    align-items: center !important;
+    width: 100% !important;
+    height: auto !important;
+    padding: 10px 14px !important;
+    background: transparent !important;
+    border: none !important;
+    border-radius: 0 !important;
+    justify-content: flex-start !important;
+    gap: 10px !important;
+    font-size: 13px !important;
+    cursor: pointer !important;
+    transition: background 0.15s !important;
+    white-space: nowrap !important;
+}
+
+.vision-option:hover {
+    background: var(--primary-lighter) !important;
+}
+
+.vision-option input[type="radio"] {
+    position: static !important;
+    opacity: 1 !important;
+    width: 16px !important;
+    height: 16px !important;
+    margin: 0 !important;
+    flex-shrink: 0 !important;
+    cursor: pointer !important;
+    accent-color: var(--primary) !important;
+}
+
+.vision-option span {
+    flex: 1 !important;
+    text-align: left !important;
+    font-size: 13px !important;
+    line-height: 1.4 !important;
+    filter: none !important;
+    color: var(--text) !important;
 }
 
 /* 输入框容器 */
