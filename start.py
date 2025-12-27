@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-启动脚本 - 一键启动本地AI助手
+启动脚本 - 一键启动灵枢 · Linga Chat
 首次运行前请先安装依赖: pip install -r requirements.txt
 """
 
@@ -29,7 +29,7 @@ def initialize_database():
 
 
 if __name__ == "__main__":
-    print("🚀 启动本地AI助手...")
+    print("� 启启动灵枢 · Linga Chat...")
     
     if not initialize_database():
         sys.exit(1)

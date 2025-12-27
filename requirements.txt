@@ -1,4 +1,4 @@
-# 本地AI助手 - Python依赖
+# 灵枢 · Linga Chat - Python依赖
 
 # ===== 核心框架 =====
 fastapi>=0.100.0
